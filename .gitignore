@@ -1,0 +1,28 @@
+# ===== IDE =====
+.vscode/
+
+# ===== Python =====
+__pycache__/
+*.pyc
+*.pyo
+
+# ===== Data / Results =====
+datasets/
+results/
+predictions/
+test_log/
+C_png/
+tooth_png/
+lists/
+model/
+
+# ===== Models / Experiments =====
+*.pt
+*.pth
+*.ckpt
+*.h5
+*.npy
+*.npz
+
+# ===== OS =====
+.DS_Store
