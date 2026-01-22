@@ -21,6 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import numpy as np
+from collections import OrderedDict
 from typing import Optional, Tuple
 
 
@@ -183,33 +184,37 @@ class GaussianDiffusion:
     ) -> torch.Tensor:
         """
         Perform one DDIM sampling step.
-        
-        Args:
-            model: Denoising model
-            x_t: Current noisy sample
-            t: Current timestep
-            t_prev: Previous timestep (target)
-            image_cond: Original image condition
-            coarse_mask_cond: Coarse segmentation mask condition
-            eta: DDIM eta parameter (0 for deterministic sampling)
-            
-        Returns:
-            Denoised sample at t_prev
         """
         batch_size = x_t.shape[0]
         t_tensor = torch.full((batch_size,), t, device=x_t.device, dtype=torch.long)
         
-        # Predict noise
+        # Predict logits of x0
         with torch.no_grad():
-            pred_noise = model(x_t, t_tensor, image_cond, coarse_mask_cond)
+            pred_logits = model(x_t, t_tensor, image_cond, coarse_mask_cond)
+            
+        # Convert logits to x0 in [-1, 1] range
+        if pred_logits.shape[1] == 1:  # Binary
+            pred_prob = torch.sigmoid(pred_logits)
+        else:
+            pred_prob = F.softmax(pred_logits, dim=1)
+            
+        # Scale to [-1, 1] for diffusion process
+        pred_x0 = pred_prob * 2 - 1
         
         # Compute alpha values
         alpha_t = self.alphas_cumprod[t]
         alpha_t_prev = self.alphas_cumprod[t_prev] if t_prev >= 0 else torch.tensor(1.0, device=x_t.device)
         
-        # Predict x_0
-        pred_x0 = (x_t - torch.sqrt(1 - alpha_t) * pred_noise) / torch.sqrt(alpha_t)
-        pred_x0 = torch.clamp(pred_x0, -1, 1)  # Clip to valid range
+        # Derive implied noise
+        # x_t = sqrt(alpha_t) * x0 + sqrt(1-alpha_t) * noise
+        sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t)
+        sqrt_alpha_t = torch.sqrt(alpha_t)
+        
+        # Avoid division by zero at t=0 (alpha_t=1)
+        if t == 0:
+            pred_noise = torch.zeros_like(x_t)
+        else:
+            pred_noise = (x_t - sqrt_alpha_t * pred_x0) / sqrt_one_minus_alpha_t
         
         # DDIM update
         sigma = eta * torch.sqrt((1 - alpha_t_prev) / (1 - alpha_t)) * torch.sqrt(1 - alpha_t / alpha_t_prev)
@@ -384,6 +389,270 @@ class Upsample(nn.Module):
         return self.conv(x)
 
 
+class PFMM(nn.Module):
+    """
+    Prior Feature Modulation Module
+    利用粗略概率图 P 作为加权因子，调制网络输入 Z
+    """
+    def __init__(self, in_channels, num_classes, out_channels=None):
+        """
+        Args:
+            in_channels: 输入特征 Z 的通道数
+            num_classes: 类别数 K (概率图 P 的通道数)
+            out_channels: 输出通道数，默认与 in_channels 相同
+        """
+        super(PFMM, self).__init__()
+        
+        self.num_classes = num_classes
+        self.in_channels = in_channels
+        self.out_channels = out_channels if out_channels else in_channels
+        
+        # 拼接后的通道数:  K * in_channels
+        concat_channels = num_classes * in_channels
+        
+        # 深度可分离卷积 (Depthwise Separable Convolution)
+        self.dwconv = nn.Sequential(
+            # Depthwise convolution
+            nn.Conv2d(concat_channels, concat_channels, kernel_size=3, 
+                      padding=1, groups=concat_channels, bias=False),
+            # Pointwise convolution
+            nn.Conv2d(concat_channels, in_channels, kernel_size=1, bias=False)
+        )
+        
+        # Layer Normalization (对应公式21中的 LN)
+        self.ln1 = nn.LayerNorm(in_channels)
+        
+        # Conv-LayerNorm-ReLU block (对应公式22)
+        self.conv = nn.Conv2d(in_channels, self.out_channels, kernel_size=3, 
+                              padding=1, bias=False)
+        self.ln2 = nn.LayerNorm(self.out_channels)
+        self.relu = nn. ReLU(inplace=True)
+    
+    def forward(self, Z, P):
+        """
+        Args:
+            Z: 网络输入特征, shape:  (B, C, H, W)
+            P: 粗略概率图, shape:  (B, K, H, W), K 为类别数
+        Returns:
+            Z''':  输出特征, shape: (B, out_channels, H, W)
+        """
+        B, C, H, W = Z.shape
+        
+        # 公式19:  按类别通道拆分 P
+        # P_split:  list of K tensors, each with shape (B, 1, H, W)
+        P_split = torch.split(P, 1, dim=1)  # [P1, P2, .. ., PK]
+        
+        # 公式20: 逐元素相乘后拼接
+        # Z' = Concat(P1 ⊙ Z, P2 ⊙ Z, ..., PK ⊙ Z)
+        weighted_features = [p * Z for p in P_split]  # 每个 Pk ⊙ Z:  (B, C, H, W)
+        Z_prime = torch.cat(weighted_features, dim=1)  # (B, K*C, H, W)
+        
+        # 公式21: Z'' = LN(DWConv(Z') ⊕ Z)
+        dwconv_out = self.dwconv(Z_prime)  # (B, C, H, W)
+        Z_double_prime = dwconv_out + Z    # 残差连接
+        
+        # LayerNorm 需要调整维度:  (B, C, H, W) -> (B, H, W, C) -> LN -> (B, C, H, W)
+        Z_double_prime = Z_double_prime.permute(0, 2, 3, 1)  # (B, H, W, C)
+        Z_double_prime = self.ln1(Z_double_prime)
+        Z_double_prime = Z_double_prime.permute(0, 3, 1, 2)  # (B, C, H, W)
+        
+        # 公式22: Z''' = ReLU(LN(Conv(Z'')))
+        Z_triple_prime = self. conv(Z_double_prime)  # (B, out_channels, H, W)
+        Z_triple_prime = Z_triple_prime.permute(0, 2, 3, 1)  # (B, H, W, out_channels)
+        Z_triple_prime = self.ln2(Z_triple_prime)
+        Z_triple_prime = Z_triple_prime. permute(0, 3, 1, 2)  # (B, out_channels, H, W)
+        Z_triple_prime = self.relu(Z_triple_prime)
+        
+        return Z_triple_prime
+
+
+class CFFM(nn.Module):
+    """
+    Conditional Feature Fusion Module
+    将原始图像的低级特征作为条件信息注入去噪过程
+    """
+    def __init__(self, f_channels, x_channels, out_channels=None):
+        """
+        Args:
+            f_channels: 特征图 F 的通道数 (来自 U-Net encoder 上一层)
+            x_channels: 低级特征 Xlow 的通道数
+            out_channels: 输出通道数，默认与 f_channels 相同
+        """
+        super(CFFM, self).__init__()
+        
+        self.f_channels = f_channels
+        self.out_channels = out_channels if out_channels else f_channels
+        
+        # 拼接后的通道数
+        concat_channels = f_channels + x_channels
+        
+        # DWConv-LN-ReLU block (对应公式24)
+        self.dwconv_block = nn.Sequential(
+            # Depthwise convolution
+            nn.Conv2d(concat_channels, concat_channels, kernel_size=3,
+                      padding=1, groups=concat_channels, bias=False),
+            # Pointwise convolution - 将通道数映射回 f_channels
+            nn.Conv2d(concat_channels, f_channels, kernel_size=1, bias=False)
+        )
+        
+        # Layer Normalization for DWConv output
+        self.ln1 = nn.LayerNorm(f_channels)
+        self.relu = nn.ReLU(inplace=True)
+        
+        # Final Layer Normalization (对应公式25)
+        self.ln2 = nn. LayerNorm(self.out_channels)
+        
+        # 如果输出通道数不同，需要投影层
+        self.proj = None
+        if self.out_channels != f_channels:
+            self.proj = nn.Conv2d(f_channels, self.out_channels, kernel_size=1, bias=False)
+    
+    def forward(self, F, Xlow):
+        """
+        Args:
+            F: U-Net encoder 上一层的特征图, shape: (B, C_f, H, W)
+            Xlow: 原始图像的低级特征, shape: (B, C_x, H, W)
+                  需要与 F 的分辨率匹配
+        Returns:
+            F''': 输出特征, shape: (B, out_channels, H, W)
+        """
+        # 公式23: F' = Concat(F, Xlow)
+        F_prime = torch.cat([F, Xlow], dim=1)  # (B, C_f + C_x, H, W)
+        
+        # 公式24: F'' = ReLU(LN(DWConv(F')))
+        F_double_prime = self.dwconv_block(F_prime)  # (B, C_f, H, W)
+        
+        # LayerNorm 需要调整维度
+        F_double_prime = F_double_prime.permute(0, 2, 3, 1)  # (B, H, W, C_f)
+        F_double_prime = self.ln1(F_double_prime)
+        F_double_prime = F_double_prime. permute(0, 3, 1, 2)  # (B, C_f, H, W)
+        F_double_prime = self.relu(F_double_prime)
+        
+        # 公式25: F''' = LN(F'' ⊕ F)
+        F_triple_prime = F_double_prime + F  # 残差连接
+        
+        # 如果需要投影
+        if self.proj is not None:
+            F_triple_prime = self.proj(F_triple_prime)
+        
+        # Final LayerNorm
+        F_triple_prime = F_triple_prime.permute(0, 2, 3, 1)
+        F_triple_prime = self.ln2(F_triple_prime)
+        F_triple_prime = F_triple_prime. permute(0, 3, 1, 2)
+        
+        return F_triple_prime
+
+
+class StdConv2d(nn.Conv2d):
+
+    def forward(self, x):
+        w = self.weight
+        v, m = torch.var_mean(w, dim=[1, 2, 3], keepdim=True, unbiased=False)
+        w = (w - m) / torch.sqrt(v + 1e-5)
+        return F.conv2d(x, w, self.bias, self.stride, self.padding,
+                        self.dilation, self.groups)
+    
+def conv3x3(cin, cout, stride=1, groups=1, bias=False):
+    return StdConv2d(cin, cout, kernel_size=3, stride=stride,
+                    padding=1, bias=bias, groups=groups)
+
+def conv1x1(cin, cout, stride=1, bias=False):
+    return StdConv2d(cin, cout, kernel_size=1, stride=stride,
+                    padding=0, bias=bias)
+
+class PreActBottleneck(nn.Module):
+    """Pre-activation (v2) bottleneck block.
+    """
+
+    def __init__(self, cin, cout=None, cmid=None, stride=1):
+        super().__init__()
+        cout = cout or cin
+        cmid = cmid or cout//4
+
+        self.gn1 = nn.GroupNorm(32, cmid, eps=1e-6)
+        self.conv1 = conv1x1(cin, cmid, bias=False)
+        self.gn2 = nn.GroupNorm(32, cmid, eps=1e-6)
+        self.conv2 = conv3x3(cmid, cmid, stride, bias=False)  # Original code has it on conv1!!
+        self.gn3 = nn.GroupNorm(32, cout, eps=1e-6)
+        self.conv3 = conv1x1(cmid, cout, bias=False)
+        self.relu = nn.ReLU(inplace=True)
+
+        if (stride != 1 or cin != cout):
+            # Projection also with pre-activation according to paper.
+            self.downsample = conv1x1(cin, cout, stride, bias=False)
+            self.gn_proj = nn.GroupNorm(cout, cout)
+
+    def forward(self, x):
+
+        # Residual branch
+        residual = x
+        if hasattr(self, 'downsample'):
+            residual = self.downsample(x)
+            residual = self.gn_proj(residual)
+
+        # Unit's branch
+        y = self.relu(self.gn1(self.conv1(x)))
+        y = self.relu(self.gn2(self.conv2(y)))
+        y = self.gn3(self.conv3(y))
+
+        y = self.relu(residual + y)
+        return y
+
+class ResNetV2(nn.Module):
+    """Implementation of Pre-activation (v2) ResNet mode."""
+
+    def __init__(self, block_units, width_factor):
+        super().__init__()
+        width = int(64 * width_factor)
+        self.width = width
+
+        self.root = nn.Sequential(OrderedDict([
+            ('conv', StdConv2d(3, width, kernel_size=7, stride=2, bias=False, padding=3)),
+            ('gn', nn.GroupNorm(32, width, eps=1e-6)),
+            ('relu', nn.ReLU(inplace=True)),
+            # ('pool', nn.MaxPool2d(kernel_size=3, stride=2, padding=0))
+        ]))
+
+        self.body = nn.Sequential(OrderedDict([
+            ('block1', nn.Sequential(OrderedDict(
+                [('unit1', PreActBottleneck(cin=width, cout=width*4, cmid=width))] +
+                [(f'unit{i:d}', PreActBottleneck(cin=width*4, cout=width*4, cmid=width)) for i in range(2, block_units[0] + 1)],
+                ))),
+            ('block2', nn.Sequential(OrderedDict(
+                [('unit1', PreActBottleneck(cin=width*4, cout=width*8, cmid=width*2, stride=2))] +
+                [(f'unit{i:d}', PreActBottleneck(cin=width*8, cout=width*8, cmid=width*2)) for i in range(2, block_units[1] + 1)],
+                ))),
+            ('block3', nn.Sequential(OrderedDict(
+                [('unit1', PreActBottleneck(cin=width*8, cout=width*16, cmid=width*4, stride=2))] +
+                [(f'unit{i:d}', PreActBottleneck(cin=width*16, cout=width*16, cmid=width*4)) for i in range(2, block_units[2] + 1)],
+                ))),
+            ('block4', nn.Sequential(OrderedDict(
+                [('unit1', PreActBottleneck(cin=width*16, cout=width*32, cmid=width*8, stride=2))] +
+                [(f'unit{i:d}', PreActBottleneck(cin=width*32, cout=width*32, cmid=width*8)) for i in range(2, block_units[3] + 1)],
+                ))),
+        ]))
+
+    def forward(self, x):
+        features = []
+        b, c, in_size, _ = x.size()
+        x = self.root(x)
+        features.append(x)
+        x = nn.MaxPool2d(kernel_size=3, stride=2, padding=0)(x)
+        for i in range(len(self.body)-1):
+            x = self.body[i](x)
+            right_size = int(in_size / 4 / (i+1))
+            if x.size()[2] != right_size:
+                pad = right_size - x.size()[2]
+                assert pad < 3 and pad > 0, "x {} should {}".format(x.size(), right_size)
+                feat = torch.zeros((b, x.size()[1], right_size, right_size), device=x.device)
+                feat[:, :, 0:x.size()[2], 0:x.size()[3]] = x[:]
+            else:
+                feat = x
+            features.append(feat)
+        x = self.body[-1](x)
+        return x, features[::-1]
+    
+
 class ConditionalDenoisingUNet(nn.Module):
     """
     Conditional U-Net for denoising in diffusion model.
@@ -437,7 +706,12 @@ class ConditionalDenoisingUNet(nn.Module):
         
         # Initial convolution
         self.init_conv = nn.Conv2d(total_in_channels, base_channels, 3, padding=1)
-        
+        self.PFMM = PFMM(in_channels=base_channels, num_classes=num_classes)
+        self.Lowencoder = ResNetV2(block_units=(3, 4, 9), width_factor=1)
+        self.CFFM = CFFM(f_channels=base_channels, x_channels=64)
+        self.cffms = nn.ModuleList([
+            CFFM(f_channels=base_channels, x_channels=64) for ch in self.enc_channels[:-1]
+        ])
         # ============== ENCODER ==============
         # We store each block's output channels and track skips
         self.encoder_blocks = nn.ModuleList()
@@ -531,7 +805,15 @@ class ConditionalDenoisingUNet(nn.Module):
         
         # Concatenate inputs
         # x (8,1,256,256) image_cond (8,3,256,256) coarse_mask_cond (8,1,256,256)--- IGNORE ---
-        x = torch.cat([x, image_cond, coarse_mask_cond], dim=1)
+        # x = torch.cat([x, image_cond, coarse_mask_cond], dim=1)
+        # 使用 PFMM 模块调制输入特征
+        x = self.PFMM(x, coarse_mask_cond)  
+
+        # 提取原始图像的低级特征
+        _ , imagefeature = self.Lowencoder(image_cond)  # (B, 64, H, W)
+
+        # 融合低级特征到初始特征
+        
         # x (8,5,256,256) --- IGNORE ---
         # Initial convolution
         h = self.init_conv(x)
@@ -743,25 +1025,27 @@ class DiffusionRefiner(nn.Module):
         # Forward diffusion: add noise to ground truth
         x_noisy, noise = self.diffusion.q_sample(x_start, t)
         
-        # Predict noise
-        pred_noise = self.denoising_net(x_noisy, t, image, coarse_mask)
+        # Predict logits of x0
+        pred_logits = self.denoising_net(x_noisy, t, image, coarse_mask)
         
         # --- 2. Loss Calculation ---
         
-        # Standard MSE loss for noise prediction
-        loss_noise = F.mse_loss(pred_noise, noise)
-        
-        # Boundary-aware Loss (Dice on predicted x0)
-        # We calculate pred_x0 inside the loop
-        pred_x0 = self.diffusion.predict_x0_from_noise(x_noisy, t, pred_noise)
-        pred_x0 = torch.clamp(pred_x0, -1, 1)
-        
-        # Convert [-1, 1] back to [0, 1] implies probabilities
-        pred_prob = (pred_x0 + 1) / 2
-        
-        # Target probabilities (same transformation)
-        target_prob = (x_start + 1) / 2
-        
+        if self.num_classes == 2:
+            # Binary Case
+            # BCEWithLogitsLoss expects float targets
+            loss_ce = F.binary_cross_entropy_with_logits(pred_logits, gt_mask.float())
+            pred_prob = torch.sigmoid(pred_logits)
+            
+            target_prob = gt_mask.float()
+        else:
+            # Multi-class Case
+            # CrossEntropyLoss expects class indices as targets (long)
+            loss_ce = F.cross_entropy(pred_logits, gt_mask.long().squeeze(1))
+            pred_prob = F.softmax(pred_logits, dim=1)
+            
+            # For dice, we need one-hot target
+            target_prob = F.one_hot(gt_mask.long().squeeze(1), self.num_classes).permute(0, 3, 1, 2).float()
+            
         # Dice Loss calculation
         smooth = 1e-5
         intersection = (pred_prob * target_prob).sum(dim=(2, 3))
@@ -769,20 +1053,14 @@ class DiffusionRefiner(nn.Module):
         dice_score = (2. * intersection + smooth) / (union + smooth)
         loss_dice = 1.0 - dice_score.mean()
         
-        # Weighted sum: 
-        # loss_dice focuses on global structure and boundaries
-        # loss_noise focuses on texture and local consistency
-        loss = loss_noise + 1.0 * loss_dice
+        # Combined loss
+        loss = loss_ce + loss_dice
         
         metrics = {
             'loss': loss.item(),
-            'loss_noise': loss_noise.item(),
+            'loss_ce': loss_ce.item(),
             'loss_dice': loss_dice.item(),
             'dice_score': dice_score.mean().item(),
-            'noise_mean': noise.mean().item(),
-            'noise_std': noise.std().item(),
-            'pred_noise_mean': pred_noise.mean().item(),
-            'pred_noise_std': pred_noise.std().item()
         }
         
         return loss, metrics

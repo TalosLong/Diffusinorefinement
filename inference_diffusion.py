@@ -22,13 +22,17 @@ from torchvision import transforms
 from scipy.ndimage import zoom
 import copy
 from datasets.dataset_synapse import Synapse_dataset
+import time
 
 # Import network components
 # Note: The directory is 'network' (singular) in this repo
 from networks.vit_seg_modeling import CONFIGS as CONFIGS_ViT_seg
 from networks.CPUNet import TransUnet_mlp as CPUNet
 from networks.diffusion_refiner import DiffusionRefiner, create_diffusion_refiner
+from networks.diffusion_refiner_distrubition import DiffusionRefiner, create_diffusion_refiner as create_diffusion_refiner_distribution
+from networks.diffusion_type_refiner import create_diffusion_refiner  as create_diffusion_refiner_type
 from utils import calculate_metric_percase
+
 
 
 def parse_args():
@@ -37,7 +41,7 @@ def parse_args():
     # Model paths
     parser.add_argument('--cpunet_path', type=str, default='/root/CPUNet/model/TU_Synapse256/+SGDpolyepochmval0.0001_0.002test_CPUNet_CVC_best.pth',
                         help='path to pretrained CPUNet checkpoint')
-    parser.add_argument('--diffusion_path', type=str, default='/root/autodl-tmp/model/diffusion_refiner_best.pth',
+    parser.add_argument('--diffusion_path', type=str, default='/root/autodl-tmp/model/diffusion_refiner_dsconv_Synapse_256_bs8_lr0.0001_timesteps1000_20260121_180833/diffusion_refiner_best.pth',
                         help='path to trained diffusion refinement model')
     parser.add_argument('--vit_name', type=str, default='R50-ViT-B_16',
                         help='vit model name for CPUNet')
@@ -49,7 +53,7 @@ def parse_args():
                         help='list dir')
     parser.add_argument('--dataset', type=str, default='Synapse',
                         help='dataset name')
-    parser.add_argument('--output_dir', type=str, default='results/diffusion_refiner',
+    parser.add_argument('--output_dir', type=str, default='/root/autodl-tmp/inference_output/diffusion_type_refiner_dsconv/timesteps1000_step50_start700',
                         help='output directory for results')
     
     # Model configuration
@@ -63,9 +67,9 @@ def parse_args():
                         help='base channels for diffusion U-Net')
     
     # Inference configuration
-    parser.add_argument('--num_inference_steps', type=int, default=15,
+    parser.add_argument('--num_inference_steps', type=int, default=50,
                         help='number of DDIM sampling steps')
-    parser.add_argument('--start_timestep', type=int, default=None,
+    parser.add_argument('--start_timestep', type=int, default=700,
                         help='starting timestep for refinement (default: 70% of num_timesteps)')
     parser.add_argument('--eta', type=float, default=0.0,
                         help='DDIM eta parameter (0 for deterministic)')
@@ -121,14 +125,32 @@ def load_cpunet(args, device):
 
 def load_diffusion_model(args, cpunet, device):
     """Load trained diffusion refinement model."""
-    model = create_diffusion_refiner(
+    # model = create_diffusion_refiner(
+    #     cpunet=cpunet,
+    #     num_classes=args.num_classes,
+    #     num_timesteps=args.num_timesteps,
+    #     base_channels=args.base_channels,
+    #     freeze_cpunet=True
+    # ).to(device)
+
+    # Alternatively, use the distribution version
+    # model = create_diffusion_refiner_distribution(
+    #     cpunet=cpunet,
+    #     num_classes=args.num_classes,
+    #     num_timesteps=args.num_timesteps,
+    #     base_channels=args.base_channels,
+    #     freeze_cpunet=True
+    # ).to(device)
+
+    # Alternatively, use the type version
+    model = create_diffusion_refiner_type(
         cpunet=cpunet,
         num_classes=args.num_classes,
         num_timesteps=args.num_timesteps,
         base_channels=args.base_channels,
         freeze_cpunet=True
     ).to(device)
-    
+
     if os.path.exists(args.diffusion_path):
         checkpoint = torch.load(args.diffusion_path, map_location=device)
         if 'model_state_dict' in checkpoint:
@@ -331,9 +353,15 @@ def inference_dataset(model, args, device):
     test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=0)
     # test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, num_workers=1)
     
+
+        # Generate timestamp string ONCE to use consistently
+    timestamp = time.strftime('%Y%m%d_%H%M%S')
+    run_output_dir = os.path.join(args.output_dir, timestamp)
+
     # Create output directory
     if args.save_images:
-        os.makedirs(args.output_dir, exist_ok=True)
+        os.makedirs(run_output_dir, exist_ok=True)
+        print(f"Prediction images will be saved to: {run_output_dir}")
     
     # Run inference
     refined_metrics_list = []
@@ -345,7 +373,7 @@ def inference_dataset(model, args, device):
         image = sampled_batch['image'].to(device)
         label = sampled_batch['label'].to(device)
         
-        save_path = args.output_dir if args.save_images else None
+        save_path = run_output_dir if args.save_images else None
         case_name = f'case_{i_batch:04d}'
         
         refined_metrics, coarse_metrics = test_single_volume_diffusion(
@@ -431,7 +459,7 @@ def main():
     refined_metrics, coarse_metrics = inference_dataset(model, args, device)
     
     # Save results to file
-    results_file = os.path.join(args.output_dir, 'results.txt')
+    results_file = os.path.join(args.output_dir, time.strftime('%Y%m%d_%H%M%S_results.txt'))
     os.makedirs(args.output_dir, exist_ok=True)
     
     with open(results_file, 'w') as f:

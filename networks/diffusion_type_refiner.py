@@ -183,33 +183,37 @@ class GaussianDiffusion:
     ) -> torch.Tensor:
         """
         Perform one DDIM sampling step.
-        
-        Args:
-            model: Denoising model
-            x_t: Current noisy sample
-            t: Current timestep
-            t_prev: Previous timestep (target)
-            image_cond: Original image condition
-            coarse_mask_cond: Coarse segmentation mask condition
-            eta: DDIM eta parameter (0 for deterministic sampling)
-            
-        Returns:
-            Denoised sample at t_prev
         """
         batch_size = x_t.shape[0]
         t_tensor = torch.full((batch_size,), t, device=x_t.device, dtype=torch.long)
         
-        # Predict noise
+        # Predict logits of x0
         with torch.no_grad():
-            pred_noise = model(x_t, t_tensor, image_cond, coarse_mask_cond)
+            pred_logits = model(x_t, t_tensor, image_cond, coarse_mask_cond)
+            
+        # Convert logits to x0 in [-1, 1] range
+        if pred_logits.shape[1] == 1:  # Binary
+            pred_prob = torch.sigmoid(pred_logits)
+        else:
+            pred_prob = F.softmax(pred_logits, dim=1)
+            
+        # Scale to [-1, 1] for diffusion process
+        pred_x0 = pred_prob * 2 - 1
         
         # Compute alpha values
         alpha_t = self.alphas_cumprod[t]
         alpha_t_prev = self.alphas_cumprod[t_prev] if t_prev >= 0 else torch.tensor(1.0, device=x_t.device)
         
-        # Predict x_0
-        pred_x0 = (x_t - torch.sqrt(1 - alpha_t) * pred_noise) / torch.sqrt(alpha_t)
-        pred_x0 = torch.clamp(pred_x0, -1, 1)  # Clip to valid range
+        # Derive implied noise
+        # x_t = sqrt(alpha_t) * x0 + sqrt(1-alpha_t) * noise
+        sqrt_one_minus_alpha_t = torch.sqrt(1 - alpha_t)
+        sqrt_alpha_t = torch.sqrt(alpha_t)
+        
+        # Avoid division by zero at t=0 (alpha_t=1)
+        if t == 0:
+            pred_noise = torch.zeros_like(x_t)
+        else:
+            pred_noise = (x_t - sqrt_alpha_t * pred_x0) / sqrt_one_minus_alpha_t
         
         # DDIM update
         sigma = eta * torch.sqrt((1 - alpha_t_prev) / (1 - alpha_t)) * torch.sqrt(1 - alpha_t / alpha_t_prev)
@@ -443,7 +447,7 @@ class ConditionalDenoisingUNet(nn.Module):
         self.encoder_blocks = nn.ModuleList()
         self.encoder_attns = nn.ModuleList()
         self.downsamples = nn.ModuleList()
-        
+
         current_res = input_resolution
         in_ch = base_channels
         self.skip_channels = [base_channels]  # First skip is from init_conv
@@ -743,25 +747,27 @@ class DiffusionRefiner(nn.Module):
         # Forward diffusion: add noise to ground truth
         x_noisy, noise = self.diffusion.q_sample(x_start, t)
         
-        # Predict noise
-        pred_noise = self.denoising_net(x_noisy, t, image, coarse_mask)
+        # Predict logits of x0
+        pred_logits = self.denoising_net(x_noisy, t, image, coarse_mask)
         
         # --- 2. Loss Calculation ---
         
-        # Standard MSE loss for noise prediction
-        loss_noise = F.mse_loss(pred_noise, noise)
-        
-        # Boundary-aware Loss (Dice on predicted x0)
-        # We calculate pred_x0 inside the loop
-        pred_x0 = self.diffusion.predict_x0_from_noise(x_noisy, t, pred_noise)
-        pred_x0 = torch.clamp(pred_x0, -1, 1)
-        
-        # Convert [-1, 1] back to [0, 1] implies probabilities
-        pred_prob = (pred_x0 + 1) / 2
-        
-        # Target probabilities (same transformation)
-        target_prob = (x_start + 1) / 2
-        
+        if self.num_classes == 2:
+            # Binary Case
+            # BCEWithLogitsLoss expects float targets
+            loss_ce = F.binary_cross_entropy_with_logits(pred_logits, gt_mask.float())
+            pred_prob = torch.sigmoid(pred_logits)
+            
+            target_prob = gt_mask.float()
+        else:
+            # Multi-class Case
+            # CrossEntropyLoss expects class indices as targets (long)
+            loss_ce = F.cross_entropy(pred_logits, gt_mask.long().squeeze(1))
+            pred_prob = F.softmax(pred_logits, dim=1)
+            
+            # For dice, we need one-hot target
+            target_prob = F.one_hot(gt_mask.long().squeeze(1), self.num_classes).permute(0, 3, 1, 2).float()
+            
         # Dice Loss calculation
         smooth = 1e-5
         intersection = (pred_prob * target_prob).sum(dim=(2, 3))
@@ -769,20 +775,14 @@ class DiffusionRefiner(nn.Module):
         dice_score = (2. * intersection + smooth) / (union + smooth)
         loss_dice = 1.0 - dice_score.mean()
         
-        # Weighted sum: 
-        # loss_dice focuses on global structure and boundaries
-        # loss_noise focuses on texture and local consistency
-        loss = loss_noise + 1.0 * loss_dice
+        # Combined loss
+        loss = loss_ce + loss_dice
         
         metrics = {
             'loss': loss.item(),
-            'loss_noise': loss_noise.item(),
+            'loss_ce': loss_ce.item(),
             'loss_dice': loss_dice.item(),
             'dice_score': dice_score.mean().item(),
-            'noise_mean': noise.mean().item(),
-            'noise_std': noise.std().item(),
-            'pred_noise_mean': pred_noise.mean().item(),
-            'pred_noise_std': pred_noise.std().item()
         }
         
         return loss, metrics

@@ -21,7 +21,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import numpy as np
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Union
 
 
 def get_timestep_embedding(timesteps: torch.Tensor, embedding_dim: int) -> torch.Tensor:
@@ -179,7 +179,9 @@ class GaussianDiffusion:
         t_prev: int,
         image_cond: torch.Tensor,
         coarse_mask_cond: torch.Tensor,
-        eta: float = 0.0
+        eta: float = 0.0,
+        cpunet_features: Optional[List[torch.Tensor]] = None,
+        high_level_feat: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Perform one DDIM sampling step.
@@ -201,7 +203,7 @@ class GaussianDiffusion:
         
         # Predict noise
         with torch.no_grad():
-            pred_noise = model(x_t, t_tensor, image_cond, coarse_mask_cond)
+            pred_noise = model(x_t, t_tensor, image_cond, coarse_mask_cond, cpunet_features, high_level_feat)
         
         # Compute alpha values
         alpha_t = self.alphas_cumprod[t]
@@ -236,7 +238,9 @@ class GaussianDiffusion:
         start_from_coarse: bool = True,
         start_timestep: Optional[int] = None,
         x_start: Optional[torch.Tensor] = None,
-        device: torch.device = torch.device('cuda')
+        device: torch.device = torch.device('cuda'),
+        cpunet_features: Optional[List[torch.Tensor]] = None,
+        high_level_feat: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         DDIM sampling for inference.
@@ -280,7 +284,7 @@ class GaussianDiffusion:
         for i in range(len(timesteps)):
             t = timesteps[i]
             t_prev = timesteps[i + 1] if i < len(timesteps) - 1 else -1
-            x = self.ddim_sample_step(model, x, t, t_prev, image_cond, coarse_mask_cond, eta)
+            x = self.ddim_sample_step(model, x, t, t_prev, image_cond, coarse_mask_cond, eta, cpunet_features, high_level_feat)
         
         return x
 
@@ -437,6 +441,43 @@ class ConditionalDenoisingUNet(nn.Module):
         
         # Initial convolution
         self.init_conv = nn.Conv2d(total_in_channels, base_channels, 3, padding=1)
+
+        # CHANGE 1: Alpha parameter for guided fusion
+        self.param_alpha = nn.Parameter(torch.tensor(0.0))
+        
+        # CHANGE 2: CPUNet Feature Adaptors (Improved)
+        # Apply GroupNorm -> SiLU -> Conv.
+        # Initialize last conv to Zero to ensure identity mapping at start of training.
+        self.cpunet_adaptors = nn.ModuleList([
+            nn.Sequential(
+                nn.GroupNorm(8, 64), nn.SiLU(),
+                nn.Conv2d(64, base_channels, 1)
+            ),
+            nn.Sequential(
+                nn.GroupNorm(32, 256), nn.SiLU(),
+                nn.Conv2d(256, base_channels * 2, 1)
+            ),
+            nn.Sequential(
+                nn.GroupNorm(32, 512), nn.SiLU(),
+                nn.Conv2d(512, base_channels * 4, 1)
+            )
+        ])
+        
+        # Zero-initialize the last convolution in each adaptor
+        for adaptor in self.cpunet_adaptors:
+            nn.init.zeros_(adaptor[-1].weight)
+            nn.init.zeros_(adaptor[-1].bias)
+
+        # CHANGE 3: High Level Attention Adaptor (Improved)
+        # High Level Feat (S16, 1024ch) -> Diffusion Bottleneck (S8, 512ch)
+        self.high_level_attn_conv = nn.Sequential(
+            nn.GroupNorm(32, 1024),
+            nn.SiLU(),
+            nn.Conv2d(1024, base_channels * 8, 1)
+        )
+        # Zero-initialize
+        nn.init.zeros_(self.high_level_attn_conv[-1].weight)
+        nn.init.zeros_(self.high_level_attn_conv[-1].bias)
         
         # ============== ENCODER ==============
         # We store each block's output channels and track skips
@@ -511,7 +552,9 @@ class ConditionalDenoisingUNet(nn.Module):
         x: torch.Tensor,
         t: torch.Tensor,
         image_cond: torch.Tensor,
-        coarse_mask_cond: torch.Tensor
+        coarse_mask_cond: torch.Tensor,
+        cpunet_features: Optional[List[torch.Tensor]] = None,
+        high_level_feat: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Forward pass.
@@ -521,6 +564,8 @@ class ConditionalDenoisingUNet(nn.Module):
             t: Timestep tensor (B,)
             image_cond: Original image condition (B, 3, H, W)
             coarse_mask_cond: Coarse segmentation mask (B, C, H, W)
+            cpunet_features: List of CPUNet encoder features
+            high_level_feat: CPUNet high level feature (S16)
             
         Returns:
             Predicted noise tensor (B, C, H, W)
@@ -529,12 +574,18 @@ class ConditionalDenoisingUNet(nn.Module):
         t_emb = get_timestep_embedding(t, self.time_mlp[0].in_features)
         t_emb = self.time_mlp(t_emb)
         
-        # Concatenate inputs
-        # x (8,1,256,256) image_cond (8,3,256,256) coarse_mask_cond (8,1,256,256)--- IGNORE ---
+        # Concatenate inputs 直接拼接-》Z_guided = Z * (1 + α * P)
+
         x = torch.cat([x, image_cond, coarse_mask_cond], dim=1)
-        # x (8,5,256,256) --- IGNORE ---
+
+        
         # Initial convolution
         h = self.init_conv(x)
+
+        # CHANGE 1: Guided Fusion Z_guided = Z * (1 + alpha * P)
+        # alpha is self.param_alpha. P is coarse_mask_cond.
+        h = h * (1.0 + self.param_alpha * coarse_mask_cond)
+
         skips = [h]
         
         # ============== ENCODER ==============
@@ -543,6 +594,28 @@ class ConditionalDenoisingUNet(nn.Module):
         down_idx = 0
         
         for level_idx in range(len(self.channel_mult)):
+            
+            # CHANGE 2: Encoder Feature Fusion
+            # F = F + Conv(low_level_feat). Applied at start of level.
+            if cpunet_features is not None:
+                feat = None
+                # Mapping: Level 1 (S2) -> cpunet[2] (S2)
+                # Level 2 (S4) -> cpunet[1] (S4)
+                # Level 3 (S8) -> cpunet[0] (S8)
+                
+                if level_idx == 1:
+                    feat = self.cpunet_adaptors[0](cpunet_features[2])
+                elif level_idx == 2:
+                    feat = self.cpunet_adaptors[1](cpunet_features[1])
+                elif level_idx == 3:
+                    feat = self.cpunet_adaptors[2](cpunet_features[0])
+                
+                if feat is not None:
+                    # Verify shape relative to h
+                    if feat.shape[-2:] != h.shape[-2:]:
+                         feat = F.interpolate(feat, size=h.shape[-2:], mode='bilinear', align_corners=False)
+                    h = h + feat
+
             # Res blocks
             for _ in range(self.num_res_blocks):
                 h = self.encoder_blocks[block_idx](h, t_emb)
@@ -561,6 +634,17 @@ class ConditionalDenoisingUNet(nn.Module):
         
         # ============== MIDDLE ==============
         h = self.mid_block1(h, t_emb)
+
+        # CHANGE 3: Bottleneck Attention
+        # Z = Z + Z * tanh(Conv(X_high))
+        if high_level_feat is not None:
+            # high_level_feat is 1024ch (S16). h is 512ch (S8).
+            x_high = self.high_level_attn_conv(high_level_feat) # 1024->512
+            # Upsample S16 to S8
+            x_high = F.interpolate(x_high, size=h.shape[-2:], mode='bilinear', align_corners=False)
+            attn = torch.tanh(x_high)
+            h = h + h * attn
+
         h = self.mid_attn(h)
         h = self.mid_block2(h, t_emb)
         
@@ -662,6 +746,23 @@ class DiffusionRefiner(nn.Module):
         
         self.num_timesteps = num_timesteps
     
+    def get_coarse_mask_and_features(self, image: torch.Tensor) -> Tuple[torch.Tensor, List[torch.Tensor], torch.Tensor]:
+        """
+        Get coarse segmentation mask and features from CPUNet.
+        """
+        with torch.no_grad():
+            self.cpunet.eval()
+            # Updated to request features
+            logits, high_level_feat, features = self.cpunet(image, return_features=True)
+            probs = F.softmax(logits, dim=1)
+            
+            mask = probs
+            if self.num_classes == 2:
+                # For binary segmentation, use foreground probability
+                mask = probs[:, 1:2, :, :]
+            
+            return mask, features, high_level_feat
+
     def get_coarse_mask(self, image: torch.Tensor) -> torch.Tensor:
         """
         Get coarse segmentation mask from CPUNet.
@@ -672,16 +773,8 @@ class DiffusionRefiner(nn.Module):
         Returns:
             Soft probability mask (B, num_classes, H, W) or (B, 1, H, W) for binary
         """
-        with torch.no_grad():
-            self.cpunet.eval()
-            logits = self.cpunet(image)  # (B, num_classes, H, W)
-            probs = F.softmax(logits, dim=1)
-            
-            if self.num_classes == 2:
-                # For binary segmentation, use foreground probability
-                return probs[:, 1:2, :, :]
-            else:
-                return probs
+        mask, _, _ = self.get_coarse_mask_and_features(image)
+        return mask
     
     def training_step(
         self,
@@ -704,25 +797,43 @@ class DiffusionRefiner(nn.Module):
         # Ensure diffusion scheduler is on correct device
         self.diffusion.to(device)
         
-        # Get coarse mask from frozen CPUNet
-        coarse_mask = self.get_coarse_mask(image)
+        # Get coarse mask AND features from CPUNet
+        coarse_mask, cpunet_features, high_level_feat = self.get_coarse_mask_and_features(image)
         
         # --- 1. Condition Augmentation ---
         # Randomly perturb coarse mask to simulate inference likelihood
-        # This makes the refiner more robust to bad coarse predictions
+        # CRITICAL: We must aggressively perturb the coarse mask during training.
+        # Since CPUNet is trained on this data, its predictions are likely very good.
+        # If we don't perturb, the diffusion model learns an identity mapping 
+        # (just copying coarse_mask) and fails to refine boundaries at inference time.
         if self.training:
-            # 50% chance to apply augmentation
-            if torch.rand(1).item() < 0.5:
-                # Randomly erode or dilate (using max pooling)
-                if torch.rand(1).item() < 0.5:
-                    # Dilation: max_pool expands high values (1s)
-                    coarse_mask = F.max_pool2d(coarse_mask, kernel_size=3, stride=1, padding=1)
-                else:
-                    # Erosion: -max_pool(-x) shrinks high values
-                    coarse_mask = -F.max_pool2d(-coarse_mask, kernel_size=3, stride=1, padding=1)
+            # Increase perturbation probability to 90%
+            if torch.rand(1).item() < 0.9:
                 
-                # Add small Gaussian noise to probabilities helps escape local optima
-                noise_perturb = torch.randn_like(coarse_mask) * 0.05
+                # Randomize kernel size for morphological ops (3, 5, or 7)
+                # Larger kernels simulate larger boundary errors
+                k_size = int(torch.randint(1, 4, (1,)).item()) * 2 + 1
+                padding = k_size // 2
+                
+                # Randomly choose distrubtion type
+                op_type = torch.rand(1).item()
+                
+                if op_type < 0.4:
+                    # Dilation: Expand the mask (simulate over-segmentation)
+                    coarse_mask = F.max_pool2d(coarse_mask, kernel_size=k_size, stride=1, padding=padding)
+                elif op_type < 0.8:
+                    # Erosion: Shrink the mask (simulate under-segmentation)
+                    # Implemented as negating, max_pool (dilate background), then negating back
+                    coarse_mask = -F.max_pool2d(-coarse_mask, kernel_size=k_size, stride=1, padding=padding)
+                else:
+                    # Random affine (shift/scale) could be added here, 
+                    # but strong noise + morph is usually sufficient.
+                    pass
+                
+                # Add stronger Gaussian noise to probabilities to simulate uncertainty
+                # Range 0.05 to 0.2
+                noise_scale = 0.05 + torch.rand(1).item() * 0.15
+                noise_perturb = torch.randn_like(coarse_mask) * noise_scale
                 coarse_mask = torch.clamp(coarse_mask + noise_perturb, 0, 1)
 
         # Prepare ground truth mask for diffusion
@@ -744,7 +855,12 @@ class DiffusionRefiner(nn.Module):
         x_noisy, noise = self.diffusion.q_sample(x_start, t)
         
         # Predict noise
-        pred_noise = self.denoising_net(x_noisy, t, image, coarse_mask)
+        # Note: Scale coarse mask to [-1, 1] for condition injection to match other inputs
+        pred_noise = self.denoising_net(
+            x_noisy, t, image, coarse_mask * 2 - 1,
+            cpunet_features=cpunet_features,
+            high_level_feat=high_level_feat
+        )
         
         # --- 2. Loss Calculation ---
         
@@ -816,8 +932,8 @@ class DiffusionRefiner(nn.Module):
         # Ensure diffusion scheduler is on correct device
         self.diffusion.to(device)
         
-        # Get coarse mask from CPUNet
-        coarse_mask = self.get_coarse_mask(image)
+        # Get coarse mask AND features
+        coarse_mask, cpunet_features, high_level_feat = self.get_coarse_mask_and_features(image)
         
         # Default start timestep: 70% of total (moderately noisy)
         if start_timestep is None:
@@ -837,13 +953,16 @@ class DiffusionRefiner(nn.Module):
             model=self.denoising_net,
             shape=shape,
             image_cond=image,
-            coarse_mask_cond=coarse_mask,
+            coarse_mask_cond=coarse_mask_scaled, # Use scaled mask for condition
             num_inference_steps=num_inference_steps,
             eta=eta,
             start_from_coarse=True,
             start_timestep=start_timestep,
             x_start=coarse_mask_scaled,
-            device=device
+            device=device,
+            # Pass features used in conditioning
+            cpunet_features=cpunet_features,
+            high_level_feat=high_level_feat
         )
         
         # Scale back to [0, 1]

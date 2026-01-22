@@ -459,7 +459,7 @@ class TransUnet_mlp(nn.Module):
         )
         self.config = config
 
-    def forward(self, x):
+    def forward(self, x, return_features=False):
         # 输入x[16，3，256，256]
         if x.size()[1] == 1:
             x = x.repeat(1,3,1,1)  # 将单通道图像扩充为三通道
@@ -472,6 +472,9 @@ class TransUnet_mlp(nn.Module):
         x= self.convformer(x)  # (B, n_patch, hidden)# 5.28 第一次调试问题1：convformer输入需要512通道数，encoder出来有1024个通道数
         # 尝试将S2mlp放在covformer之后
         x = self.s2att(x)# [16, 1024, 16, 16]
+
+        high_level_feat = x
+        
         # 5.28 调试问题2：convformer输出与decoder输入不匹配
         # s2 convformer不改变x的shape
         x = self.decoder1(x, features[0])# ([16, 512, 32, 32])
@@ -483,6 +486,9 @@ class TransUnet_mlp(nn.Module):
         x = self.decoder4(x) # [16, 64, 256, 256]
 
         logits = self.segmentation_head(x)# 5.29 调试问题3：分割头与decoder输出通道数不匹配，修改config['decoder_channels']
+        
+        if return_features:
+            return logits, high_level_feat, features
         return logits
     
     def load_from(self, weights):

@@ -16,6 +16,7 @@ import random
 import sys
 import time
 import math
+import datetime
 import numpy as np
 import torch
 import torch.nn as nn
@@ -31,6 +32,9 @@ os.environ['CUDA_VISIBLE_DEVICES'] = "0"
 from networks.vit_seg_modeling import CONFIGS as CONFIGS_ViT_seg
 from networks.CPUNet import TransUnet_mlp as CPUNet
 from networks.diffusion_refiner import DiffusionRefiner, create_diffusion_refiner
+from networks.diffusion_refiner_distrubition import DiffusionRefiner, create_diffusion_refiner as create_diffusion_refiner_distribution
+from networks.diffusion_type_refiner import create_diffusion_refiner  as create_diffusion_refiner_type
+
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Train Diffusion Refinement Model')
@@ -44,7 +48,7 @@ def parse_args():
                         default='Synapse', help='dataset name')
     
     # CPUNet configuration
-    parser.add_argument('--cpunet_path', type=str, required=True,
+    parser.add_argument('--cpunet_path', type=str, default='/root/CPUNet/model/TU_Synapse256/+SGDpolyepochmval0.0001_0.002test_CPUNet_CVC_best.pth',
                         help='path to pretrained CPUNet checkpoint')
     parser.add_argument('--vit_name', type=str,
                         default='R50-ViT-B_16', help='vit model name for CPUNet')
@@ -127,13 +131,13 @@ def train_diffusion_refiner(args, model, train_loader, val_loader, snapshot_path
     """Training loop for diffusion refinement model."""
     
     # Setup logging
-    logging.basicConfig(
-        filename=os.path.join(snapshot_path, "diffusion_train.log"),
-        level=logging.INFO,
-        format='[%(asctime)s.%(msecs)03d] %(message)s',
-        datefmt='%m/%d/%Y %H:%M:%S'
-    )
-    logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
+    # logging.basicConfig(
+    #     filename=os.path.join(snapshot_path, "diffusion_train.log"),
+    #     level=logging.INFO,
+    #     format='[%(asctime)s.%(msecs)03d] %(message)s',
+    #     datefmt='%m/%d/%Y %H:%M:%S'
+    # )
+    # logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
     logging.info(str(args))
     
     # Setup optimizer (only train diffusion model, CPUNet is frozen)
@@ -173,6 +177,9 @@ def train_diffusion_refiner(args, model, train_loader, val_loader, snapshot_path
         model.cpunet.eval()
         
         epoch_loss = 0.0
+        epoch_loss_ce = 0.0
+        epoch_loss_dice = 0.0
+        epoch_dice_score = 0.0
         epoch_samples = 0
         
         for i_batch, sampled_batch in enumerate(train_loader):
@@ -190,8 +197,12 @@ def train_diffusion_refiner(args, model, train_loader, val_loader, snapshot_path
             scheduler.step()
             
             # Update statistics
-            epoch_loss += loss.item() * image_batch.shape[0]
-            epoch_samples += image_batch.shape[0]
+            bs = image_batch.shape[0]
+            epoch_loss += loss.item() * bs
+            epoch_loss_ce += metrics['loss_ce'] * bs
+            epoch_loss_dice += metrics['loss_dice'] * bs
+            epoch_dice_score += metrics['dice_score'] * bs
+            epoch_samples += bs
             iter_num += 1
             
             # Logging
@@ -209,8 +220,17 @@ def train_diffusion_refiner(args, model, train_loader, val_loader, snapshot_path
         
         # Epoch statistics
         avg_epoch_loss = epoch_loss / epoch_samples
+        avg_loss_ce = epoch_loss_ce / epoch_samples
+        avg_loss_dice = epoch_loss_dice / epoch_samples
+        avg_dice_score = epoch_dice_score / epoch_samples
+        
         writer.add_scalar('train/epoch_loss', avg_epoch_loss, epoch_num)
-        logging.info(f'Epoch [{epoch_num+1}] Average Loss: {avg_epoch_loss:.6f}')
+        writer.add_scalar('train/epoch_loss_ce', avg_loss_ce, epoch_num)
+        writer.add_scalar('train/epoch_loss_dice', avg_loss_dice, epoch_num)
+        writer.add_scalar('train/epoch_dice_score', avg_dice_score, epoch_num)
+        
+        logging.info(f'Epoch [{epoch_num+1}] Avg Loss: {avg_epoch_loss:.6f} '
+                     f'(CE: {avg_loss_ce:.6f}, DiceLoss: {avg_loss_dice:.6f}, DiceScore: {avg_dice_score:.4f})')
         
         # Validation
         if val_loader is not None:
@@ -221,7 +241,7 @@ def train_diffusion_refiner(args, model, train_loader, val_loader, snapshot_path
             # Save best model
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
-                save_path = os.path.join("/root/autodl-tmp/model", 'diffusion_refiner_best.pth')
+                save_path = os.path.join(snapshot_path, 'diffusion_refiner_best.pth')
                 torch.save({
                     'epoch': epoch_num,
                     'model_state_dict': model.state_dict(),
@@ -232,7 +252,7 @@ def train_diffusion_refiner(args, model, train_loader, val_loader, snapshot_path
         
         # Periodic checkpoint
         if (epoch_num + 1) % args.save_interval == 0:
-            save_path = os.path.join("/root/autodl-tmp/model", f'diffusion_refiner_epoch_{epoch_num+1}.pth')
+            save_path = os.path.join(snapshot_path, f'diffusion_refiner_epoch_{epoch_num+1}.pth')
             torch.save({
                 'epoch': epoch_num,
                 'model_state_dict': model.state_dict(),
@@ -242,7 +262,7 @@ def train_diffusion_refiner(args, model, train_loader, val_loader, snapshot_path
             logging.info(f'Checkpoint saved to {save_path}')
     
     # Save final model
-    save_path = os.path.join("/root/autodl-tmp/model", 'diffusion_refiner_final.pth')
+    save_path = os.path.join(snapshot_path, 'diffusion_refiner_final.pth')
     torch.save({
         'epoch': args.max_epochs,
         'model_state_dict': model.state_dict(),
@@ -307,13 +327,20 @@ def main():
     # root_path and list_dir should be provided via command line arguments
     
     # Create snapshot directory
-    snapshot_path = f"model/diffusion_refiner_{args.dataset}_{args.img_size}"
-    snapshot_path += f"_bs{args.batch_size}_lr{args.base_lr}"
-    snapshot_path += f"_timesteps{args.num_timesteps}"
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    snapshot_path = os.path.join("/root/autodl-tmp/model", f"diffusion_refiner_dsconv_{args.dataset}_{args.img_size}_bs{args.batch_size}_lr{args.base_lr}_timesteps{args.num_timesteps}_{timestamp}")
     
     if not os.path.exists(snapshot_path):
         os.makedirs(snapshot_path)
     
+    logging.basicConfig(
+        filename=os.path.join(snapshot_path, "diffusion_train.log"),
+        level=logging.INFO,
+        format='[%(asctime)s.%(msecs)03d] %(message)s',
+        datefmt='%m/%d/%Y %H:%M:%S'
+    )
+    logging.getLogger().addHandler(logging.StreamHandler(sys.stdout))
+
     # Load data - import with error handling
     try:
         from datasets.dataset_synapse import Synapse_dataset, RandomGenerator
@@ -368,14 +395,23 @@ def main():
     cpunet = load_cpunet(args, device)
     
     # Create DiffusionRefiner model
-    model = create_diffusion_refiner(
-        cpunet=cpunet,
-        num_classes=args.num_classes,
-        num_timesteps=args.num_timesteps,
-        base_channels=args.base_channels,
-        freeze_cpunet=True
+    # model = create_diffusion_refiner(
+    #     cpunet=cpunet,
+    #     num_classes=args.num_classes,
+    #     num_timesteps=args.num_timesteps,
+    #     base_channels=args.base_channels,
+    #     freeze_cpunet=True
+    # ).to(device)
+
+    # Using the type version
+    model = create_diffusion_refiner_type(
+    cpunet=cpunet,
+    num_classes=args.num_classes,
+    num_timesteps=args.num_timesteps,
+    base_channels=args.base_channels,
+    freeze_cpunet=True
     ).to(device)
-    
+
     # Multi-GPU support
     if args.n_gpu > 1:
         model = nn.DataParallel(model)
