@@ -543,6 +543,115 @@ class CFFM(nn.Module):
         return F_triple_prime
 
 
+class SACM(nn.Module):
+    """
+    Spatial and Channel Attention Module
+    将原始图像的高级特征注入到 U-Net encoder 的高级语义特征中
+    基于通道注意力和空间注意力机制
+    """
+    def __init__(self, x_channels, s_channels, reduction_ratio=16):
+        """
+        Args:
+            x_channels:  高级特征 Xhigh 的通道数
+            s_channels: 语义特征 S 的通道数 (U-Net encoder 输出)
+            reduction_ratio: MLP 中的通道缩减比例
+        """
+        super(SACM, self).__init__()
+        
+        self.x_channels = x_channels
+        self.s_channels = s_channels
+        
+        # 对 Xhigh 的卷积层 (公式26, 27中的 Conv)
+        self.conv_xhigh = nn.Conv2d(x_channels, s_channels, kernel_size=3, 
+                                     padding=1, bias=False)
+        
+        # 全局池化层 (公式26, 27)
+        self.global_max_pool = nn.AdaptiveMaxPool2d(1)
+        self.global_avg_pool = nn.AdaptiveAvgPool2d(1)
+        
+        # 共享 MLP 用于通道注意力 (公式28)
+        reduced_channels = max(s_channels // reduction_ratio, 8)
+        self.mlp = nn.Sequential(
+            nn. Linear(s_channels, reduced_channels, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(reduced_channels, s_channels, bias=False)
+        )
+        
+        # 空间注意力的深度可分离卷积 (公式29)
+        self.spatial_dwconv = nn.Sequential(
+            # Depthwise convolution
+            nn.Conv2d(2 * s_channels, 2 * s_channels, kernel_size=7,
+                      padding=3, groups=2 * s_channels, bias=False),
+            # Pointwise convolution - 输出单通道空间注意力图
+            nn.Conv2d(2 * s_channels, 1, kernel_size=1, bias=False)
+        )
+        
+        # 对 S 的卷积层 (公式30)
+        self.conv_s = nn.Conv2d(s_channels, s_channels, kernel_size=3, 
+                                 padding=1, bias=False)
+        
+        # Sigmoid 激活
+        self.sigmoid = nn. Sigmoid()
+        
+        # 最终的 Layer Normalization (公式31)
+        self.ln = nn.LayerNorm(s_channels)
+    
+    def forward(self, S, Xhigh):
+        """
+        Args:
+            S:  U-Net encoder 输出的高级语义特征, shape: (B, C_s, H, W)
+            Xhigh: 原始图像的高级特征, shape: (B, C_x, H, W)
+        Returns:
+            S'':  融合后的输出特征, shape: (B, C_s, H, W)
+        """
+        B, C_s, H, W = S.shape
+        
+        # ============ 通道注意力 (Channel Attention) ============
+        # 对 Xhigh 进行卷积
+        X_conv = self.conv_xhigh(Xhigh)  # (B, C_s, H, W)
+        
+        # 公式26: X'_max = MaxPool(Conv(Xhigh))
+        X_max = self. global_max_pool(X_conv)  # (B, C_s, 1, 1)
+        X_max = X_max.view(B, C_s)  # (B, C_s)
+        
+        # 公式27: X'_avg = AvgPool(Conv(Xhigh))
+        X_avg = self.global_avg_pool(X_conv)  # (B, C_s, 1, 1)
+        X_avg = X_avg.view(B, C_s)  # (B, C_s)
+        
+        # 公式28: CA = Sigmoid(MLP(X'_max) + MLP(X'_avg))
+        CA = self.sigmoid(self.mlp(X_max) + self.mlp(X_avg))  # (B, C_s)
+        CA = CA.view(B, C_s, 1, 1)  # (B, C_s, 1, 1) 用于广播
+        
+        # ============ 空间注意力 (Spatial Attention) ============
+        # 保留空间维度的池化特征
+        X_max_spatial = torch.max(X_conv, dim=1, keepdim=True)[0]  # (B, 1, H, W)
+        X_max_spatial = X_max_spatial.expand(-1, C_s, -1, -1)  # (B, C_s, H, W)
+        
+        X_avg_spatial = torch.mean(X_conv, dim=1, keepdim=True)  # (B, 1, H, W)
+        X_avg_spatial = X_avg_spatial.expand(-1, C_s, -1, -1)  # (B, C_s, H, W)
+        
+        # 公式29: SA = Sigmoid(DWConv(Concat(X'_max, X'_avg)))
+        X_concat = torch.cat([X_max_spatial, X_avg_spatial], dim=1)  # (B, 2*C_s, H, W)
+        SA = self.sigmoid(self.spatial_dwconv(X_concat))  # (B, 1, H, W)
+        
+        # ============ 特征融合 ============
+        # 公式30: S' = Conv(S)
+        S_prime = self.conv_s(S)  # (B, C_s, H, W)
+        
+        # 公式31: S'' = LN(S ⊕ (CA ⊙ S') ⊕ (SA ⊙ S'))
+        CA_weighted = CA * S_prime  # 通道注意力加权:  (B, C_s, H, W)
+        SA_weighted = SA * S_prime  # 空间注意力加权: (B, C_s, H, W)
+        
+        S_double_prime = S + CA_weighted + SA_weighted  # 残差连接
+        
+        # Layer Normalization
+        S_double_prime = S_double_prime.permute(0, 2, 3, 1)  # (B, H, W, C_s)
+        S_double_prime = self.ln(S_double_prime)
+        S_double_prime = S_double_prime.permute(0, 3, 1, 2)  # (B, C_s, H, W)
+        
+        return S_double_prime
+
+
 class StdConv2d(nn.Conv2d):
 
     def forward(self, x):
