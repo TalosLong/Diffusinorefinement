@@ -260,7 +260,7 @@ def postprocess_mask(
     mask: np.ndarray,
     original_size: Optional[Tuple[int, int]] = None,
     threshold: float = 0.5,
-    min_object_size: int = 100,
+    min_object_size: int = 0,
     apply_morphology: bool = True,
     fill_holes_flag: bool = True,
     smooth: bool = True,
