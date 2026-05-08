@@ -1,570 +1,524 @@
-# 基于条件扩散模型的医学图像分割优化方法：扩散模块组件详述
+# 基于条件扩散模型的医学图像分割精细化方法：扩散模块设计与实现
 
-# Conditional Diffusion Model for Medical Image Segmentation Refinement: A Detailed Description of Diffusion Module Components
 
----
+**摘　要**
 
-## 摘要 (Abstract)
+本章详细阐述基于条件扩散模型的医学图像分割精细化系统中扩散模块的各核心组件。该系统采用两阶段架构：第一阶段由粗分割网络（CPUNet）产生初始分割概率图；第二阶段引入条件去噪扩散概率模型对分割边界进行精细化优化。扩散模块涵盖高斯扩散调度器、时间步嵌入编码器、条件残差块、自注意力模块、先验特征调制模块（PFMM）、条件特征融合模块（CFFM）、空间与通道注意力模块（SACM）、多尺度图像特征编码器以及小波空间变换器（WS-Former）等关键组件。本章按模块逐一阐述各组件的设计原理、数学推导及实现细节。
 
-本文详细描述了一种基于条件扩散模型的医学图像分割优化系统中扩散模块的各个组件。该系统采用两阶段架构：首先通过粗分割网络（CPUNet）获得初始分割结果，然后利用条件扩散模型对分割边界进行精细化优化。扩散模块包含高斯扩散调度器、条件去噪U-Net、先验特征调制模块（PFMM）、条件特征融合模块（CFFM）、空间与通道注意力模块（SACM）、图像特征编码器、以及小波空间Transformer（WS-Former）等核心组件。本文按模块逐一阐述各组件的设计原理、数学公式和实现细节。
+**关键词**：条件扩散模型；医学图像分割；去噪扩散概率模型；小波变换；注意力机制
 
----
 
-## 1. 引言 (Introduction)
+## 第一节　引言
 
-医学图像分割是计算机辅助诊断的基础任务。尽管深度学习方法（如U-Net及其变体）已在该领域取得显著进展，但粗分割结果往往在目标边界区域存在不精确性。为解决这一问题，本系统引入去噪扩散概率模型（Denoising Diffusion Probabilistic Models, DDPM）作为后处理优化手段，通过逐步去噪过程精细化分割边界。
+医学图像分割是计算机辅助诊断与治疗规划的核心基础任务。随着深度学习技术的迅速发展，以U-Net及其变体为代表的卷积神经网络模型在医学图像分割领域取得了显著成果。然而，此类模型所产生的粗分割结果在病变组织边界区域往往存在轮廓不精确、细节缺失等问题，制约了临床应用的进一步推广。
 
-系统整体架构如下：
+为解决上述问题，本系统在粗分割网络的基础上，引入去噪扩散概率模型（Denoising Diffusion Probabilistic Models，DDPM）作为后处理精细化手段。扩散模型通过模拟数据的逐步加噪与去噪过程，具备强大的概率生成能力，能够在保留粗分割整体结构的同时，逐步消除边界噪声，恢复精细的解剖轮廓。系统整体流程如下：
 
-```
-输入图像 → 预处理 → CPUNet（粗分割）→ 扩散优化模块 → 后处理 → 最终分割结果
-```
+$$
+\text{输入图像} \xrightarrow{\text{预处理}} \text{CPUNet（粗分割）} \xrightarrow{\text{扩散精细化}} \text{后处理} \xrightarrow{} \text{最终分割结果}
+$$
 
-扩散优化模块是本系统的核心创新点，其内部由多个精心设计的子模块组成。以下各节将分别详细描述这些组件。
+扩散优化模块是本系统的核心创新所在，其内部由多个精心设计的功能子模块有机组合而成。本章以下各节将依次对各组件的设计原理与数学公式进行系统性阐述。
 
----
 
-## 2. 高斯扩散调度器 (Gaussian Diffusion Scheduler)
+## 第二节　高斯扩散调度器
 
-### 2.1 概述
+### 2.1　概述
 
-高斯扩散调度器（`GaussianDiffusion` 类）是扩散模型的数学基础，负责管理前向扩散（加噪）和反向扩散（去噪）过程中的噪声调度。
+高斯扩散调度器是扩散模型的数学基础，负责统一管理前向扩散（加噪）过程与反向扩散（去噪）过程中的噪声水平调度，并为网络训练和推理采样提供必要的统计量支撑。
 
-### 2.2 前向扩散过程 (Forward Diffusion Process)
+### 2.2　前向扩散过程
 
-前向扩散过程定义了如何逐步向干净数据 $x_0$（真实分割掩码）中添加高斯噪声：
+前向扩散过程定义了如何向干净数据 $x_0$（真实分割掩码）中逐步添加高斯噪声，使其演变为趋近于标准正态分布的随机变量。其条件分布定义为：
 
-$$q(x_t | x_0) = \mathcal{N}(x_t; \sqrt{\bar{\alpha}_t} x_0, (1 - \bar{\alpha}_t) \mathbf{I})$$
+$$q(x_t \mid x_0) = \mathcal{N}\!\left(x_t;\, \sqrt{\bar{\alpha}_t}\, x_0,\; (1 - \bar{\alpha}_t)\, \mathbf{I}\right) \tag{2-1}$$
 
-其中：
-- $\beta_t$ 为噪声调度参数（noise schedule），按线性或余弦方式递增
-- $\alpha_t = 1 - \beta_t$
-- $\bar{\alpha}_t = \prod_{s=1}^{t} \alpha_s$ 为累积乘积
+其中，$\beta_t$ 为噪声调度参数，按预设方案随时间步单调递增；$\alpha_t = 1 - \beta_t$；$\bar{\alpha}_t = \prod_{s=1}^{t} \alpha_s$ 为累积乘积。利用重参数化技巧，可在任意时间步 $t$ 直接对 $x_t$ 进行闭式采样：
 
-直接采样公式为：
+$$x_t = \sqrt{\bar{\alpha}_t} \cdot x_0 + \sqrt{1 - \bar{\alpha}_t} \cdot \epsilon, \quad \epsilon \sim \mathcal{N}(0, \mathbf{I}) \tag{2-2}$$
 
-$$x_t = \sqrt{\bar{\alpha}_t} \cdot x_0 + \sqrt{1 - \bar{\alpha}_t} \cdot \epsilon, \quad \epsilon \sim \mathcal{N}(0, \mathbf{I})$$
+### 2.3　噪声调度方案
 
-### 2.3 噪声调度方案 (Beta Schedule)
+本系统支持两种噪声调度方案以适应不同训练场景。
 
-系统支持两种噪声调度方案：
+**（1）线性调度方案**
 
-**线性调度 (Linear Schedule)：**
+$$\beta_t = \beta_{\text{start}} + \frac{t}{T}\left(\beta_{\text{end}} - \beta_{\text{start}}\right) \tag{2-3}$$
 
-$$\beta_t = \beta_{\text{start}} + \frac{t}{T}(\beta_{\text{end}} - \beta_{\text{start}})$$
+默认超参数设置为 $\beta_{\text{start}} = 10^{-4}$，$\beta_{\text{end}} = 0.02$，总步数 $T = 1000$。
 
-默认参数：$\beta_{\text{start}} = 10^{-4}$，$\beta_{\text{end}} = 0.02$，$T = 1000$。
+**（2）余弦调度方案**
 
-**余弦调度 (Cosine Schedule)：**
+$$\bar{\alpha}_t = \frac{f(t)}{f(0)}, \quad f(t) = \cos^2\!\left(\frac{t/T + s}{1 + s} \cdot \frac{\pi}{2}\right) \tag{2-4}$$
 
-$$\bar{\alpha}_t = \frac{f(t)}{f(0)}, \quad f(t) = \cos\left(\frac{t/T + s}{1 + s} \cdot \frac{\pi}{2}\right)^2$$
+其中 $s = 0.008$ 为防止 $\beta_t$ 在 $t$ 趋近于零时过小而引入的偏移常数。余弦调度在扩散过程两端变化较为平缓，有助于模型在低噪声水平下更充分地学习细节。
 
-其中 $s = 0.008$ 为偏移常数，防止 $\beta_t$ 在 $t$ 接近 $0$ 时过小。
+### 2.4　反向过程后验参数
 
-### 2.4 后验分布参数 (Posterior Distribution)
+反向过程的真实后验分布 $q(x_{t-1} \mid x_t, x_0)$ 为高斯分布，其均值与方差可解析计算：
 
-反向过程的后验分布 $q(x_{t-1} | x_t, x_0)$ 相关参数预计算如下：
+$$\tilde{\mu}_t(x_t, x_0) = \frac{\sqrt{\bar{\alpha}_{t-1}}\, \beta_t}{1 - \bar{\alpha}_t}\, x_0 + \frac{\sqrt{\alpha_t}(1 - \bar{\alpha}_{t-1})}{1 - \bar{\alpha}_t}\, x_t \tag{2-5}$$
 
-$$\tilde{\mu}_t(x_t, x_0) = \frac{\sqrt{\bar{\alpha}_{t-1}} \beta_t}{1 - \bar{\alpha}_t} x_0 + \frac{\sqrt{\alpha_t}(1 - \bar{\alpha}_{t-1})}{1 - \bar{\alpha}_t} x_t$$
+$$\tilde{\beta}_t = \frac{1 - \bar{\alpha}_{t-1}}{1 - \bar{\alpha}_t}\, \beta_t \tag{2-6}$$
 
-$$\tilde{\beta}_t = \frac{1 - \bar{\alpha}_{t-1}}{1 - \bar{\alpha}_t} \beta_t$$
+上述参数在模型初始化阶段完成预计算并缓存，以提升训练和推理效率。
 
-### 2.5 DDIM 采样 (DDIM Sampling)
+### 2.5　DDIM 加速采样
 
-为加速推理，系统采用 DDIM（Denoising Diffusion Implicit Models）采样策略。DDIM 允许在远少于 $T$ 步的子序列上进行确定性或随机采样：
+为降低推理阶段的计算开销，本系统采用去噪扩散隐式模型（Denoising Diffusion Implicit Models，DDIM）<sup>[2]</sup> 作为推理采样策略。DDIM 在不改变边缘分布的前提下，允许在远小于 $T$ 的子时间步序列上完成确定性或随机采样。给定网络预测的 $\hat{x}_0$ 及推导得到的噪声估计 $\hat{\epsilon}$，单步去噪更新规则为：
 
-给定预测的 $\hat{x}_0$ 和推导的噪声 $\hat{\epsilon}$：
+$$x_{t-1} = \sqrt{\bar{\alpha}_{t-1}} \cdot \hat{x}_0 + \sqrt{1 - \bar{\alpha}_{t-1} - \sigma_t^2} \cdot \hat{\epsilon} + \sigma_t \cdot z \tag{2-7}$$
 
-$$x_{t-1} = \sqrt{\bar{\alpha}_{t-1}} \cdot \hat{x}_0 + \sqrt{1 - \bar{\alpha}_{t-1} - \sigma_t^2} \cdot \hat{\epsilon} + \sigma_t \cdot z$$
+其中，$\sigma_t = \eta \sqrt{\dfrac{1 - \bar{\alpha}_{t-1}}{1 - \bar{\alpha}_t}} \sqrt{1 - \dfrac{\bar{\alpha}_t}{\bar{\alpha}_{t-1}}}$，$z \sim \mathcal{N}(0, \mathbf{I})$。当 $\eta = 0$ 时，采样过程退化为完全确定性的，消除了随机性带来的方差。本系统默认以 20～50 步 DDIM 采样替代完整的 1000 步 DDPM 采样，在推理效率与分割精度之间取得良好平衡。
 
-其中 $\sigma_t = \eta \sqrt{\frac{1 - \bar{\alpha}_{t-1}}{1 - \bar{\alpha}_t}} \sqrt{1 - \frac{\bar{\alpha}_t}{\bar{\alpha}_{t-1}}}$，$\eta = 0$ 时为确定性采样。
 
-系统默认采用 20-50 步 DDIM 采样替代完整的 1000 步采样，在推理效率和结果质量之间取得良好平衡。
+## 第三节　时间步嵌入编码器
 
----
+### 3.1　概述
 
-## 3. 时间步嵌入 (Timestep Embedding)
+时间步嵌入编码器负责将离散的扩散时间步 $t \in \{0, 1, \ldots, T-1\}$ 映射为连续的高维向量表示，使去噪网络能够感知当前的噪声水平，并据此调整特征提取策略。
 
-### 3.1 概述
+### 3.2　正弦位置编码
 
-时间步嵌入（`get_timestep_embedding` 函数）将离散的扩散时间步 $t$ 映射为连续的高维向量表示，使去噪网络能够感知当前的噪声水平。
+参考 Transformer 中的经典位置编码设计<sup>[6]</sup>，时间步嵌入采用正弦函数族对不同频率进行编码：
 
-### 3.2 正弦位置编码
+$$\text{PE}(t, 2i) = \sin\!\left(\frac{t}{10000^{2i/d}}\right) \tag{3-1}$$
 
-采用 Transformer 中经典的正弦位置编码方案：
+$$\text{PE}(t, 2i+1) = \cos\!\left(\frac{t}{10000^{2i/d}}\right) \tag{3-2}$$
 
-$$\text{PE}(t, 2i) = \sin\left(\frac{t}{10000^{2i/d}}\right)$$
+其中 $d$ 为嵌入维度（默认取 256），$i$ 为维度索引。该编码方案能够为每个时间步赋予唯一且平滑变化的频率指纹，有利于网络学习跨时间步的连续性。
 
-$$\text{PE}(t, 2i+1) = \cos\left(\frac{t}{10000^{2i/d}}\right)$$
+正弦编码随后经过一个两层多层感知机（MLP）进行非线性变换：
 
-其中 $d$ 为嵌入维度（默认 256），$i$ 为维度索引。
+$$e_t = W_2 \cdot \text{SiLU}(W_1 \cdot \text{PE}(t) + b_1) + b_2 \tag{3-3}$$
 
-该编码随后经过两层 MLP 进一步变换：
+其中 $\text{SiLU}(x) = x \cdot \sigma(x)$ 为 Sigmoid 线性单元激活函数。变换后的嵌入向量 $e_t$ 维度与去噪网络各残差块内部通道数保持一致，以实现逐层无缝注入。
 
-$$e_t = W_2 \cdot \text{SiLU}(W_1 \cdot \text{PE}(t) + b_1) + b_2$$
 
-输出维度与残差块内部通道数一致，用于逐层注入时间步信息。
+## 第四节　条件残差块
 
----
+### 4.1　概述
 
-## 4. 条件残差块 (Conditional Residual Block)
+条件残差块是条件去噪网络的基本构建单元。在标准残差连接的基础上，该模块引入了时间步条件注入机制，使网络能够根据当前扩散时间步动态调整特征响应，从而在不同噪声水平下展现差异化的去噪行为。
 
-### 4.1 概述
+### 4.2　结构设计
 
-条件残差块（`ConditionalResBlock` 类）是去噪U-Net的基本构建单元，在标准残差连接的基础上引入了时间步条件。
+设输入特征为 $x$，时间步嵌入为 $e_t$，残差块的完整计算流程如下：
 
-### 4.2 结构设计
+$$h = \text{Conv}_{3 \times 3}\!\left(\text{SiLU}\!\left(\text{GN}(x)\right)\right) \tag{4-1}$$
 
-每个残差块包含以下计算流程：
+$$h \leftarrow h + W_t \cdot \text{SiLU}(e_t) \tag{4-2}$$
 
-$$h = \text{Conv}_{3 \times 3}(\text{SiLU}(\text{GN}(x)))$$
+$$h = \text{Conv}_{3 \times 3}\!\left(\text{Dropout}\!\left(\text{SiLU}\!\left(\text{GN}(h)\right)\right)\right) \tag{4-3}$$
 
-$$h = h + \text{MLP}(e_t)$$
+$$\text{output} = h + \text{Shortcut}(x) \tag{4-4}$$
 
-$$h = \text{Conv}_{3 \times 3}(\text{Dropout}(\text{SiLU}(\text{GN}(h))))$$
+其中，$\text{GN}(\cdot)$ 为分组归一化（Group Normalization），分组数取 8；时间步嵌入通过线性投影 $W_t \in \mathbb{R}^{d_t \times C_{\text{out}}}$ 扩展到与特征图通道数相同的维度后，以广播加法的形式作用于空间维度上的所有位置，即
 
-$$\text{output} = h + \text{Shortcut}(x)$$
+$$h' = h + (W_t \cdot \text{SiLU}(e_t))_{:,\,:,\, \text{None},\, \text{None}} \tag{4-5}$$
 
-其中：
-- $\text{GN}$ 为分组归一化（Group Normalization，8 组）
-- $\text{SiLU}$ 为 Sigmoid Linear Unit 激活函数：$\text{SiLU}(x) = x \cdot \sigma(x)$
-- $e_t$ 为时间步嵌入，通过 MLP 投影后以加性方式注入
-- 当输入输出通道数不一致时，$\text{Shortcut}$ 使用 $1 \times 1$ 卷积进行维度匹配
+当输入与输出通道数不一致时，捷径连接 $\text{Shortcut}(\cdot)$ 采用 $1 \times 1$ 卷积进行通道维度匹配；否则使用恒等映射。
 
-### 4.3 时间步注入机制
 
-时间步信息通过以下方式注入特征图：
+## 第五节　自注意力模块
 
-$$h' = h + (W_t \cdot \text{SiLU}(e_t))[:, :, \text{None}, \text{None}]$$
+### 5.1　概述
 
-即将时间步嵌入经线性变换后扩展为空间维度，与卷积特征逐通道相加。这使得网络在不同噪声水平下表现出不同的去噪行为。
+自注意力模块用于在特征图内部建模长距离空间依赖关系，以弥补局部卷积操作感受野有限的不足。本系统在条件去噪网络的瓶颈层及特定低分辨率层中嵌入该模块。
 
----
+### 5.2　多头自注意力计算
 
-## 5. 自注意力块 (Self-Attention Block)
+设输入特征 $X \in \mathbb{R}^{B \times C \times H \times W}$，自注意力模块的计算流程如下。
 
-### 5.1 概述
+首先对输入进行分组归一化以稳定训练：
 
-自注意力块（`AttentionBlock` 类）用于捕获特征图中的长距离空间依赖关系，在去噪U-Net的瓶颈层和特定分辨率层中使用。
+$$\hat{X} = \text{GN}(X) \tag{5-1}$$
 
-### 5.2 多头自注意力机制
+随后将空间维度展平，转换为序列形式 $\hat{X}_{\text{flat}} \in \mathbb{R}^{B \times HW \times C}$，并以此计算多头注意力（默认注意力头数为 4）：
 
-给定输入特征 $X \in \mathbb{R}^{B \times C \times H \times W}$：
+$$\text{Attention}(Q, K, V) = \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right)V \tag{5-2}$$
 
-1. 先进行分组归一化：$\hat{X} = \text{GN}(X)$
+最后通过残差连接与输入相加，得到最终输出：
 
-2. 将空间维度展平：$\hat{X}_{\text{flat}} \in \mathbb{R}^{B \times (H \cdot W) \times C}$
+$$\text{output} = X + \text{Proj}\!\left(\text{Attention}(\hat{X}_{\text{flat}})\right) \tag{5-3}$$
 
-3. 计算多头注意力（默认 4 头）：
+考虑到计算复杂度与空间尺寸成平方关系，本系统仅在特征图分辨率为 $16 \times 16$ 和 $8 \times 8$ 的层级应用自注意力，以在计算效率与全局表征能力之间取得合理权衡。
 
-$$\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V$$
 
-4. 残差连接：$\text{output} = X + \text{Proj}(\text{Attention}(\hat{X}_{\text{flat}}))$
+## 第六节　先验特征调制模块
 
-系统在分辨率为 $16 \times 16$ 和 $8 \times 8$ 的特征图上应用自注意力，以在计算效率和表征能力之间取得平衡。
+### 6.1　概述
 
----
+先验特征调制模块（Prior Feature Modulation Module，PFMM）是条件去噪网络的输入端调制单元。该模块将粗分割网络（CPUNet）生成的 $K$ 类概率图 $P$ 作为先验空间信息，对初始卷积后的特征 $Z$ 进行类别感知的加权调制，使去噪网络在处理初始阶段即能感知粗分割结果的空间分布规律，从而将后续去噪过程的注意力引导至需要精细化的边界区域。
 
-## 6. 先验特征调制模块 (Prior Feature Modulation Module, PFMM)
+### 6.2　数学推导
 
-### 6.1 概述
+设 $P \in \mathbb{R}^{B \times K \times H \times W}$ 为 $K$ 类概率图，$Z \in \mathbb{R}^{B \times C \times H \times W}$ 为待调制的特征张量。PFMM 的计算过程由以下四步构成。
 
-PFMM（`PFMM` 类）是扩散去噪网络的输入端调制模块。它利用 CPUNet 生成的粗分割概率图 $P$ 作为先验信息，对初始卷积后的特征 $Z$ 进行调制，使去噪网络在处理初始阶段就能感知粗分割结果的空间分布。
+**（1）概率图通道拆分**
 
-### 6.2 数学公式
+$$P = [P_1,\, P_2,\, \ldots,\, P_K], \quad P_k \in \mathbb{R}^{B \times 1 \times H \times W} \tag{6-1}$$
 
-设 $P \in \mathbb{R}^{B \times K \times H \times W}$ 为 $K$ 类概率图，$Z \in \mathbb{R}^{B \times C \times H \times W}$ 为待调制特征。
+**（2）类别加权特征拼接**
 
-**步骤一：概率图通道拆分**
+$$Z' = \text{Concat}(P_1 \odot Z,\; P_2 \odot Z,\; \ldots,\; P_K \odot Z) \in \mathbb{R}^{B \times KC \times H \times W} \tag{6-2}$$
 
-$$P = [P_1, P_2, \ldots, P_K], \quad P_k \in \mathbb{R}^{B \times 1 \times H \times W}$$
+其中 $\odot$ 表示逐元素乘法，利用广播机制在通道维度实现类别感知的特征加权。
 
-**步骤二：加权特征拼接**
+**（3）深度可分离卷积与残差归一化**
 
-$$Z' = \text{Concat}(P_1 \odot Z, P_2 \odot Z, \ldots, P_K \odot Z) \in \mathbb{R}^{B \times (K \cdot C) \times H \times W}$$
+$$Z'' = \text{LN}\!\left(\text{DWConv}(Z') \oplus Z\right) \tag{6-3}$$
 
-其中 $\odot$ 表示逐元素乘法（广播机制下的通道级加权）。
+其中 $\text{DWConv}(\cdot)$ 为深度可分离卷积（逐通道卷积后接 $1 \times 1$ 逐点卷积，将通道数由 $KC$ 映射回 $C$），$\oplus$ 表示残差加法，$\text{LN}(\cdot)$ 为层归一化。
 
-**步骤三：深度可分离卷积与残差连接**
+**（4）最终输出**
 
-$$Z'' = \text{LN}(\text{DWConv}(Z') \oplus Z)$$
+$$Z''' = \text{ReLU}\!\left(\text{LN}\!\left(\text{Conv}_{3 \times 3}(Z'')\right)\right) \tag{6-4}$$
 
-其中 $\text{DWConv}$ 为深度可分离卷积（先逐通道卷积，再 $1 \times 1$ 逐点卷积），$\oplus$ 为残差加法。
+### 6.3　设计分析
 
-**步骤四：最终输出**
+PFMM 的核心设计思路在于：通过将各类别概率图分别与特征图相乘，高概率区域（即粗分割置信度高的区域）对应的特征得到增强，低概率区域的特征则被相对抑制。这一机制使去噪网络在初始特征提取阶段即融入了粗分割的空间先验，有效缩减了后续去噪需要修正的搜索空间。
 
-$$Z''' = \text{ReLU}(\text{LN}(\text{Conv}_{3 \times 3}(Z'')))$$
 
-### 6.3 设计动机
+## 第七节　条件特征融合模块
 
-通过将每个类别的概率图分别与特征相乘，PFMM 实现了类别感知的特征调制。高概率区域的特征得到增强，低概率区域的特征被抑制，从而引导去噪过程关注需要精细化的区域。
+### 7.1　概述
 
----
+条件特征融合模块（Conditional Feature Fusion Module，CFFM）负责将多尺度图像特征编码器所提取的低级图像特征注入到条件去噪网络编码器的对应层级中。该模块作用于编码器的前三个尺度层（对应较高分辨率的层级），确保去噪网络在特征编码阶段能够持续参考原始图像的纹理细节与边缘梯度信息，从而在分割边界处实现更高精度的精细化。
 
-## 7. 条件特征融合模块 (Conditional Feature Fusion Module, CFFM)
+### 7.2　数学推导
 
-### 7.1 概述
+设 $F \in \mathbb{R}^{B \times C_f \times H \times W}$ 为条件去噪网络编码器某层的特征图，$X_{\text{low}} \in \mathbb{R}^{B \times C_x \times H \times W}$ 为图像特征编码器对应尺度的低级特征（已经过 $1 \times 1$ 卷积投影与空间插值，确保尺度与通道数一致）。CFFM 的计算过程如下。
 
-CFFM（`CFFM` 类）负责将原始图像的低级特征注入到去噪U-Net编码器的各层中。它在编码器的前三个尺度层（高分辨率层）工作，确保去噪过程能够参考原始图像的纹理和边缘信息。
+**（1）特征拼接**
 
-### 7.2 数学公式
+$$F' = \text{Concat}(F,\; X_{\text{low}}) \in \mathbb{R}^{B \times (C_f + C_x) \times H \times W} \tag{7-1}$$
 
-设 $F \in \mathbb{R}^{B \times C_f \times H \times W}$ 为U-Net编码器某层的特征，$X_{\text{low}} \in \mathbb{R}^{B \times C_x \times H \times W}$ 为图像编码器对应尺度的低级特征（经投影对齐通道数后）。
+**（2）深度可分离卷积提取融合特征**
 
-**步骤一：特征拼接**
+$$F'' = \text{ReLU}\!\left(\text{LN}\!\left(\text{DWConv}(F')\right)\right) \tag{7-2}$$
 
-$$F' = \text{Concat}(F, X_{\text{low}}) \in \mathbb{R}^{B \times (C_f + C_x) \times H \times W}$$
+其中 $\text{DWConv}(\cdot)$ 将拼接后的通道数由 $C_f + C_x$ 映射回 $C_f$。
 
-**步骤二：深度可分离卷积处理**
+**（3）残差连接与归一化**
 
-$$F'' = \text{ReLU}(\text{LN}(\text{DWConv}(F')))$$
+$$F''' = \text{LN}(F'' \oplus F) \tag{7-3}$$
 
-其中 $\text{DWConv}$ 将拼接后的通道映射回 $C_f$ 维度。
+### 7.3　设计分析
 
-**步骤三：残差连接与归一化**
+低级图像特征（如边缘响应、局部纹理）是指导分割边界精确定位的重要依据，而扩散去噪过程中的深层语义特征本身对这些局部细节缺乏直接感知能力。CFFM 通过深度可分离卷积对融合特征进行高效非线性变换，同时利用残差连接保留编码器原有的语义表达，实现了局部细节与去噪特征的有机融合。
 
-$$F''' = \text{LN}(F'' \oplus F)$$
 
-### 7.3 设计动机
+## 第八节　空间与通道注意力模块
 
-低级图像特征（如边缘、纹理）对于分割边界的精确定位至关重要。CFFM 通过深度可分离卷积高效融合这些信息，同时残差连接确保了编码器原有特征的保留。
+### 8.1　概述
 
----
+空间与通道注意力模块（Spatial and Channel Attention Module，SACM）作用于条件去噪网络编码器的最深层（即最低分辨率层级），负责将图像特征编码器提取的高级语义特征以注意力驱动的方式融入编码器的深层表示。与前述 CFFM 采用拼接与卷积的显式融合策略不同，SACM 通过双路注意力机制（通道注意力与空间注意力）实现更具选择性的自适应特征整合。
 
-## 8. 空间与通道注意力模块 (Spatial and Channel Attention Module, SACM)
+### 8.2　通道注意力分支
 
-### 8.1 概述
+设 $X_{\text{high}} \in \mathbb{R}^{B \times C_x \times H \times W}$ 为图像特征编码器的高级特征。首先经卷积投影统一通道维度：
 
-SACM（`SACM` 类）在去噪U-Net编码器的最深层（最低分辨率层）使用，负责将图像编码器提取的高级语义特征融入编码器的深层表示。与CFFM不同，SACM通过注意力机制（而非简单拼接）实现更精细的特征交互。
+$$X' = \text{Conv}_{3 \times 3}(X_{\text{high}}) \in \mathbb{R}^{B \times C_s \times H \times W} \tag{8-1}$$
 
-### 8.2 通道注意力 (Channel Attention, CA)
+对 $X'$ 施以全局最大池化与全局平均池化，分别得到：
 
-**步骤一：特征投影**
+$$X'_{\text{max}} = \text{GAP}_{\max}(X') \in \mathbb{R}^{B \times C_s}, \quad X'_{\text{avg}} = \text{GAP}_{\text{avg}}(X') \in \mathbb{R}^{B \times C_s} \tag{8-2}$$
 
-对高级图像特征 $X_{\text{high}}$ 进行卷积投影：
+将两路池化结果分别送入共享参数的两层 MLP（通道压缩比 $r = 16$）并求和，经 Sigmoid 激活后得到通道注意力权重：
 
-$$X' = \text{Conv}_{3 \times 3}(X_{\text{high}}) \in \mathbb{R}^{B \times C_s \times H \times W}$$
+$$\text{CA} = \sigma\!\left(\text{MLP}(X'_{\text{max}}) + \text{MLP}(X'_{\text{avg}})\right) \in \mathbb{R}^{B \times C_s} \tag{8-3}$$
 
-**步骤二：全局池化**
+其中，$\text{MLP}(x) = W_2 \cdot \text{ReLU}(W_1 \cdot x)$，$W_1 \in \mathbb{R}^{C_s \times (C_s/r)}$，$W_2 \in \mathbb{R}^{(C_s/r) \times C_s}$。
 
-$$X'_{\text{max}} = \text{GlobalMaxPool}(X') \in \mathbb{R}^{B \times C_s}$$
+### 8.3　空间注意力分支
 
-$$X'_{\text{avg}} = \text{GlobalAvgPool}(X') \in \mathbb{R}^{B \times C_s}$$
+对 $X'$ 在通道维度上分别取最大值与均值，得到空间统计特征：
 
-**步骤三：通道注意力权重**
+$$X'_{\max,\text{sp}} = \max_{c}(X') \in \mathbb{R}^{B \times 1 \times H \times W}, \quad X'_{\text{avg,sp}} = \text{mean}_{c}(X') \in \mathbb{R}^{B \times 1 \times H \times W} \tag{8-4}$$
 
-$$\text{CA} = \sigma(\text{MLP}(X'_{\text{max}}) + \text{MLP}(X'_{\text{avg}})) \in \mathbb{R}^{B \times C_s}$$
+将上述两者在通道维度扩展后拼接，经深度可分离卷积与 Sigmoid 激活得到空间注意力图：
 
-其中 MLP 为共享参数的两层全连接网络（含通道缩减比 $r = 16$）：
+$$X_{\text{cat}} = \text{Concat}(X'_{\max,\text{sp}},\; X'_{\text{avg,sp}}) \in \mathbb{R}^{B \times 2C_s \times H \times W} \tag{8-5}$$
 
-$$\text{MLP}(x) = W_2 \cdot \text{ReLU}(W_1 \cdot x)$$
+$$\text{SA} = \sigma\!\left(\text{DWConv}_{7 \times 7}(X_{\text{cat}})\right) \in \mathbb{R}^{B \times 1 \times H \times W} \tag{8-6}$$
 
-### 8.3 空间注意力 (Spatial Attention, SA)
+### 8.4　双路注意力特征融合
 
-**步骤一：空间级池化**
+设 $S \in \mathbb{R}^{B \times C_s \times H \times W}$ 为条件去噪网络编码器深层特征，最终融合输出为：
 
-$$X'_{\text{max\_spatial}} = \max_{c}(X') \in \mathbb{R}^{B \times 1 \times H \times W}$$
+$$S' = \text{Conv}_{3 \times 3}(S) \tag{8-7}$$
 
-$$X'_{\text{avg\_spatial}} = \text{mean}_{c}(X') \in \mathbb{R}^{B \times 1 \times H \times W}$$
+$$S'' = \text{LN}\!\left(S \oplus (\text{CA} \odot S') \oplus (\text{SA} \odot S')\right) \tag{8-8}$$
 
-经通道扩展后拼接：
+### 8.5　设计分析
 
-$$X_{\text{concat}} = \text{Concat}(X'_{\text{max\_spatial}}, X'_{\text{avg\_spatial}}) \in \mathbb{R}^{B \times 2C_s \times H \times W}$$
+SACM 的设计思路借鉴了卷积块注意力模块（Convolutional Block Attention Module，CBAM）<sup>[5]</sup> 的框架思想，但将其由单模态特征自增强改造为跨模态特征融合机制。通道注意力通过感知高级图像语义特征的通道重要性分布，选择性地强化去噪特征的语义相关通道；空间注意力则通过识别图像高级特征中具有判别性的空间区域，引导去噪网络聚焦于解剖结构的关键位置。两路注意力协同作用，有效弥补了深层去噪特征在语义感知层面的不足。
 
-**步骤二：空间注意力权重**
 
-$$\text{SA} = \sigma(\text{DWConv}_{7 \times 7}(X_{\text{concat}})) \in \mathbb{R}^{B \times 1 \times H \times W}$$
+## 第九节　多尺度图像特征编码器
 
-### 8.4 特征融合
+### 9.1　概述
 
-$$S' = \text{Conv}_{3 \times 3}(S)$$
+多尺度图像特征编码器基于 ResNet-V2 预激活残差网络架构，从原始输入图像中提取四个分辨率层级的特征图，分别为后续各条件注入模块（CFFM 和 SACM）提供不同粒度的图像先验信息。
 
-$$S'' = \text{LN}(S \oplus (\text{CA} \odot S') \oplus (\text{SA} \odot S'))$$
+### 9.2　网络结构
 
-其中 $S$ 为U-Net编码器的深层特征，$\oplus$ 为逐元素加法，$\odot$ 为逐元素乘法。
+编码器由一个根节点卷积层（Root）与三个残差阶段（Stage）组成，各阶段采用预激活瓶颈残差块（Pre-Activation Bottleneck Block）堆叠而成。各阶段的输出规格如表9-1所示。
 
-### 8.5 设计动机
+**表9-1　多尺度图像特征编码器各阶段输出规格**
 
-SACM 借鉴了 CBAM（Convolutional Block Attention Module）的思想，但将其改造为跨模态特征融合机制。通道注意力捕获"哪些特征通道重要"，空间注意力捕获"哪些空间位置重要"，两者协同将高级语义信息精确地注入到去噪过程中。
+| 阶段 | 输出通道数 | 输出空间分辨率 | 残差块数量 | 对应条件注入模块 |
+|:----:|:---------:|:-------------:|:---------:|:--------------:|
+| Root | 64 | $H/2 \times W/2$ | — | CFFM（第0层级） |
+| Stage 1 | 256 | $H/4 \times W/4$ | 3 | CFFM（第1层级） |
+| Stage 2 | 512 | $H/8 \times W/8$ | 4 | CFFM（第2层级） |
+| Stage 3 | 1024 | $H/16 \times W/16$ | 6 | SACM（第3层级） |
 
----
+### 9.3　预激活瓶颈残差块
 
-## 9. 图像特征编码器 (Image Feature Encoder)
+预激活瓶颈残差块在标准瓶颈结构的基础上，将批归一化（Batch Normalization）和激活函数置于卷积操作之前（即"先归一化再激活"），有助于改善深层网络的梯度传播特性<sup>[7]</sup>。设输入为 $x$，计算流程如下：
 
-### 9.1 概述
+$$y = \text{ReLU}\!\left(\text{GN}_1\!\left(\text{Conv}_{1 \times 1}(x)\right)\right) \tag{9-1}$$
 
-图像特征编码器（`ImageFeatureEncoder` 类）基于 ResNet-V2 架构，从原始输入图像中提取多尺度特征，供 CFFM 和 SACM 使用。
+$$y = \text{ReLU}\!\left(\text{GN}_2\!\left(\text{Conv}_{3 \times 3}(y)\right)\right) \tag{9-2}$$
 
-### 9.2 架构设计
+$$y = \text{GN}_3\!\left(\text{Conv}_{1 \times 1}(y)\right) \tag{9-3}$$
 
-编码器采用预激活瓶颈残差块（Pre-Activation Bottleneck），结构如下：
+$$\text{output} = \text{ReLU}\!\left(y + \text{Downsample}(x)\right) \tag{9-4}$$
 
-| 阶段 | 输出通道数 | 输出分辨率 | 残差块数量 | 供给模块 |
-|------|-----------|-----------|-----------|---------|
-| Root（初始卷积） | 64 | $H/2 \times W/2$ | - | CFFM (Level 0) |
-| Stage 1 | 256 | $H/4 \times W/4$ | 3 | CFFM (Level 1) |
-| Stage 2 | 512 | $H/8 \times W/8$ | 4 | CFFM (Level 2) |
-| Stage 3 | 1024 | $H/16 \times W/16$ | 6 | SACM (Level 3) |
+此处所有卷积层均采用权重标准化卷积（Weight Standardization），对卷积核权重实施标准化处理：
 
-### 9.3 预激活瓶颈残差块
+$$\hat{w} = \frac{w - \mu_w}{\sqrt{\sigma_w^2 + \epsilon}} \tag{9-5}$$
 
-每个 Pre-Activation Bottleneck 的计算流程为：
+权重标准化与分组归一化的结合能够进一步提升特征表示的稳定性，在小批量训练场景下效果尤为显著。
 
-$$y = \text{ReLU}(\text{GN}_1(\text{Conv}_{1 \times 1}(x)))$$
+### 9.4　通道对齐投影层
 
-$$y = \text{ReLU}(\text{GN}_2(\text{Conv}_{3 \times 3}(y)))$$
+由于图像特征编码器各阶段的输出通道数（64、256、512、1024）与条件去噪网络编码器各层级通道数（64、128、256、512）存在不匹配，系统在两者之间引入 $1 \times 1$ 卷积投影层进行通道对齐：
 
-$$y = \text{GN}_3(\text{Conv}_{1 \times 1}(y))$$
+$$\hat{F}_i = \text{ReLU}\!\left(\text{GN}\!\left(\text{Conv}_{1 \times 1}(F_i)\right)\right) \tag{9-6}$$
 
-$$\text{output} = \text{ReLU}(y + \text{Downsample}(x))$$
+当两者通道数相同时，投影层退化为恒等映射以避免不必要的参数开销。此外，若编码器特征与去噪网络特征的空间尺寸不一致，系统还会通过双线性插值进行空间对齐，以保证各条件注入模块能够正常运作。
 
-其中使用权重标准化卷积（`StdConv2d`）：
 
-$$\hat{w} = \frac{w - \mu_w}{\sqrt{\sigma_w^2 + \epsilon}}$$
+## 第十节　小波空间变换器
 
-### 9.4 通道投影
+### 10.1　概述
 
-由于图像编码器各阶段的通道数（64, 256, 512, 1024）与去噪U-Net编码器各层的通道数（64, 128, 256, 512）不完全匹配，系统引入 $1 \times 1$ 卷积投影层将其对齐：
+小波空间变换器（Wavelet-Space Transformer，WS-Former）是本系统扩散精细化模块的核心创新组件，与 SACM 协同作用于条件去噪网络编码器的最深层级。该模块利用一维离散小波变换（Discrete Wavelet Transform，DWT）将特征图分解至频率域，在小波子带空间中分别对低频语义分量与高频细节分量执行交叉注意力交互，并通过时间步自适应门控机制动态调节各子带的信号权重，最终经逆小波变换（Inverse DWT，IDWT）重建精细化的空间域特征。
 
-$$\hat{F}_i = \text{ReLU}(\text{GN}(\text{Conv}_{1 \times 1}(F_i)))$$
+### 10.2　二维离散小波分解
 
----
+对输入特征 $F \in \mathbb{R}^{B \times C \times H \times W}$ 实施一级 Haar 小波变换，得到四个子带分量：
 
-## 10. 小波空间Transformer (Wavelet-Space Transformer, WS-Former)
+$$\text{DWT}(F) = \left(F_{\text{LL}},\; \left[F_{\text{LH}},\; F_{\text{HL}},\; F_{\text{HH}}\right]\right) \tag{10-1}$$
 
-### 10.1 概述
+其中，$F_{\text{LL}} \in \mathbb{R}^{B \times C \times H/2 \times W/2}$ 为低频近似子带，保留了特征图的主要语义结构；$F_{\text{LH}},\, F_{\text{HL}},\, F_{\text{HH}} \in \mathbb{R}^{B \times C \times H/2 \times W/2}$ 分别为水平、垂直与对角方向的高频细节子带，编码了边缘与纹理等局部细节信息<sup>[8]</sup>。
 
-WS-Former（`WS_Former` 类）是本系统的核心创新模块，在去噪U-Net编码器的最深层使用（与SACM并行）。它利用离散小波变换（DWT）将特征分解到频率域，在小波空间中进行扩散特征与条件特征的交叉注意力交互，并根据时间步自适应地控制不同频率子带的权重。
+### 10.3　小波域交叉注意力
 
-### 10.2 小波分解 (Wavelet Decomposition)
+对扩散去噪特征 $N$ 与条件图像特征 $C$ 分别执行 DWT 分解后，在对应子带之间进行跨模态交叉注意力交互。交叉注意力模块的 Query 来自去噪特征子带（引导精细化方向），Key 与 Value 均来自条件特征子带（提供参考信息）。
 
-对输入特征 $F \in \mathbb{R}^{B \times C \times H \times W}$ 进行一级 Haar 小波变换：
+**（1）低频子带语义对齐**
 
-$$\text{DWT}(F) = (F_{\text{LL}}, [F_{\text{LH}}, F_{\text{HL}}, F_{\text{HH}}])$$
+$$\hat{N}_{\text{LL}} = \text{CrossAttn}(N_{\text{LL}},\; C_{\text{LL}}) + N_{\text{LL}} \tag{10-2}$$
 
-其中：
-- $F_{\text{LL}} \in \mathbb{R}^{B \times C \times H/2 \times W/2}$：低频子带（近似系数），包含主要语义信息
-- $F_{\text{LH}}, F_{\text{HL}}, F_{\text{HH}} \in \mathbb{R}^{B \times C \times H/2 \times W/2}$：高频子带（水平、垂直、对角细节系数），包含边缘和纹理信息
+其中，交叉注意力的计算式为：
 
-### 10.3 小波域交叉注意力 (Wavelet Cross-Attention)
+$$Q = W_Q \cdot N_{\text{LL}},\quad K = W_K \cdot C_{\text{LL}},\quad V = W_V \cdot C_{\text{LL}} \tag{10-3}$$
 
-对扩散噪声特征 $N$ 和条件特征 $C$ 分别进行小波分解后，在各子带之间进行交叉注意力：
+$$\text{CrossAttn}(Q, K, V) = W_O \cdot \text{softmax}\!\left(\frac{QK^\top}{\sqrt{d_k}}\right) V \tag{10-4}$$
 
-**低频子带对齐（语义对齐）：**
+**（2）高频子带细节对齐**
 
-$$\hat{N}_{\text{LL}} = \text{CrossAttn}_{\text{LL}}(N_{\text{LL}}, C_{\text{LL}}) + N_{\text{LL}}$$
+三个高频子带（$\text{LH}$、$\text{HL}$、$\text{HH}$）以 Batch 维度合并后共享同一注意力模块参数进行并行处理：
 
-其中 Query 来自扩散特征，Key/Value 来自条件特征：
+$$\left[\hat{N}_{\text{LH}},\; \hat{N}_{\text{HL}},\; \hat{N}_{\text{HH}}\right] = \text{CrossAttn}_{\text{High}}\!\left(\left[N_{\text{LH}}, N_{\text{HL}}, N_{\text{HH}}\right],\; \left[C_{\text{LH}}, C_{\text{HL}}, C_{\text{HH}}\right]\right) + \left[N_{\text{LH}}, N_{\text{HL}}, N_{\text{HH}}\right] \tag{10-5}$$
 
-$$Q = W_Q \cdot N_{\text{LL}}, \quad K = W_K \cdot C_{\text{LL}}, \quad V = W_V \cdot C_{\text{LL}}$$
+### 10.4　时间自适应子带门控
 
-$$\text{CrossAttn}(Q, K, V) = W_O \cdot \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right)V$$
+去噪过程中不同时间步所需的频率信息侧重存在显著差异：在早期去噪阶段（$t$ 较大，噪声水平高）应优先依赖低频子带的语义结构信息以恢复整体轮廓；在后期精细化阶段（$t$ 较小，噪声水平低）则需增大高频子带的贡献以恢复边缘细节。为此，时间自适应子带门控模块根据当前时间步嵌入 $e_t$ 学习四个子带的动态加权系数：
 
-**高频子带对齐（边缘/细节对齐）：**
+$$\left[g_{\text{LL}},\; g_{\text{LH}},\; g_{\text{HL}},\; g_{\text{HH}}\right] = \sigma\!\left(\text{MLP}(e_t)\right) \in [0, 1]^{C \times 4} \tag{10-6}$$
 
-三个高频子带（LH, HL, HH）合并到批次维度并行处理，共享同一注意力模块参数：
+门控加权后的子带输出为：
 
-$$[\hat{N}_{\text{LH}}, \hat{N}_{\text{HL}}, \hat{N}_{\text{HH}}] = \text{CrossAttn}_{\text{High}}([N_{\text{LH}}, N_{\text{HL}}, N_{\text{HH}}], [C_{\text{LH}}, C_{\text{HL}}, C_{\text{HH}}]) + [N_{\text{LH}}, N_{\text{HL}}, N_{\text{HH}}]$$
+$$\hat{N}'_{\text{LL}} = g_{\text{LL}} \odot \hat{N}_{\text{LL}} \tag{10-7}$$
 
-### 10.4 时间自适应子带门控 (Time-Adaptive Subband Gating)
+$$\hat{N}'_{\text{LH}} = g_{\text{LH}} \odot \hat{N}_{\text{LH}},\quad \hat{N}'_{\text{HL}} = g_{\text{HL}} \odot \hat{N}_{\text{HL}},\quad \hat{N}'_{\text{HH}} = g_{\text{HH}} \odot \hat{N}_{\text{HH}} \tag{10-8}$$
 
-`TimeAdaptiveSubbandGating` 模块根据当前扩散时间步 $t$ 动态调整各子带的权重，核心思想是：
+### 10.5　逆小波重构与特征输出
 
-- **早期去噪阶段**（$t$ 较大）：噪声水平高，应更依赖低频语义信息
-- **后期去噪阶段**（$t$ 较小）：噪声水平低，应更关注高频细节信息
+经门控处理后的子带特征通过逆小波变换重建为空间域特征：
 
-门控权重计算：
+$$F_{\text{out}} = \text{IDWT}\!\left(\hat{N}'_{\text{LL}},\; \left[\hat{N}'_{\text{LH}},\; \hat{N}'_{\text{HL}},\; \hat{N}'_{\text{HH}}\right]\right) \tag{10-9}$$
 
-$$[g_{\text{LL}}, g_{\text{LH}}, g_{\text{HL}}, g_{\text{HH}}] = \sigma(\text{MLP}(e_t)) \in [0, 1]^{C \times 4}$$
+最终通过由两个 $1 \times 1$ 卷积层、批归一化与 SiLU 激活函数组成的特征投影网络，输出维度与输入保持一致的精细化特征图。
 
-各子带加权：
+### 10.6　设计分析
 
-$$\hat{N}'_{\text{LL}} = g_{\text{LL}} \odot \hat{N}_{\text{LL}}$$
+传统扩散模型在欧氏空间域直接对特征进行整合，难以同时兼顾全局语义一致性与局部边缘精度。WS-Former 通过引入小波频率分解，将特征交互转移至各向异性的频率子带空间，实现了语义信息与细节信息的解耦处理。低频交叉注意力负责语义层面的粗对齐，高频交叉注意力则专注于边缘和纹理层面的细节对齐；时间自适应门控进一步确保去噪过程中的频率关注点能够随噪声水平动态自适应地调整，从而在整个去噪轨迹上均保持高质量的条件注入效果。
 
-$$\hat{N}'_{\text{LH}} = g_{\text{LH}} \odot \hat{N}_{\text{LH}}, \quad \hat{N}'_{\text{HL}} = g_{\text{HL}} \odot \hat{N}_{\text{HL}}, \quad \hat{N}'_{\text{HH}} = g_{\text{HH}} \odot \hat{N}_{\text{HH}}$$
 
-### 10.5 小波重构与输出
+## 第十一节　条件去噪网络
 
-经门控加权后，通过逆小波变换（IDWT）重构空间域特征：
+### 11.1　概述
 
-$$F_{\text{out}} = \text{IDWT}(\hat{N}'_{\text{LL}}, [\hat{N}'_{\text{LH}}, \hat{N}'_{\text{HL}}, \hat{N}'_{\text{HH}}])$$
+条件去噪网络是扩散精细化模块的主体架构，采用经典的编码器—解码器对称结构（U-Net），并在各层级系统性地集成了上述所有条件注入模块，以实现对多源条件信息的充分利用。
 
-最终通过 MLP 投影（$1 \times 1$ 卷积 + BatchNorm + SiLU + $1 \times 1$ 卷积）得到输出。
+### 11.2　整体架构
 
-### 10.6 设计动机
+网络的整体前向传播流程如下：输入噪声掩码 $x_t$ 经初始 $3 \times 3$ 卷积层映射为基础通道维度后，立即由 PFMM 利用粗分割先验概率图 $P$ 进行调制，将空间先验信息植入初始特征。
 
-传统扩散模型在空间域直接处理特征，难以同时兼顾全局语义一致性和局部边缘精度。WS-Former 通过将交互过程转移到小波域实现频率解耦，低频子带负责语义对齐，高频子带负责边缘细节对齐，时间自适应门控则确保去噪过程中的频率关注点随噪声水平动态变化。
+编码器由四个层级组成，各层级依次包含若干条件残差块、可选的自注意力模块以及条件注入单元（前三层级使用 CFFM，第四层级使用 SACM 与 WS-Former 的组合）；相邻层级之间通过步长为 2 的卷积下采样实现空间分辨率减半。各层级的输出特征通过跳跃连接保存，供解码器的对应层级使用。
 
----
+瓶颈层由"条件残差块—自注意力模块—条件残差块"的串行结构组成，负责在最低分辨率层级对全局特征进行充分整合。
 
-## 11. 条件去噪U-Net (Conditional Denoising U-Net)
+解码器与编码器对称，各层级通过转置卷积实现上采样，并将解码器特征与跳跃连接来的编码器特征在通道维度拼接后经条件残差块进一步处理。最终输出层由分组归一化、SiLU 激活和 $3 \times 3$ 卷积组成，生成预测的分割 logits。
 
-### 11.1 概述
+### 11.3　网络超参数
 
-条件去噪U-Net（`ConditionalDenoisingUNet` 类）是扩散模块的主体网络架构，基于U-Net编码器-解码器结构，综合集成了上述各条件注入模块。
+网络的主要可配置超参数如表11-1所示。
 
-### 11.2 整体架构
+**表11-1　条件去噪网络主要超参数**
 
-```
-输入（噪声掩码 x_t）
-    │
-    ▼
-初始卷积 (Conv 3×3) → base_channels
-    │
-    ▼
-PFMM 调制（引入粗分割先验 P）
-    │
-    ▼
-╔═══════════════════════════════════╗
-║          编码器 (Encoder)          ║
-║                                   ║
-║  Level 0: 2×ResBlock + CFFM      ║ ← 图像低级特征 (64 ch, H/2)
-║      ↓ Downsample                 ║
-║  Level 1: 2×ResBlock + CFFM      ║ ← 图像低级特征 (256 ch, H/4)
-║      ↓ Downsample                 ║
-║  Level 2: 2×ResBlock + CFFM      ║ ← 图像低级特征 (512 ch, H/8)
-║      ↓ Downsample                 ║
-║  Level 3: 2×ResBlock + Attn      ║
-║           + SACM + WS-Former     ║ ← 图像高级特征 (1024 ch, H/16)
-╚═══════════════════════════════════╝
-    │
-    ▼
-╔═══════════════════════════════════╗
-║       瓶颈层 (Bottleneck)         ║
-║  ResBlock → Attention → ResBlock  ║
-╚═══════════════════════════════════╝
-    │
-    ▼
-╔═══════════════════════════════════╗
-║          解码器 (Decoder)          ║
-║                                   ║
-║  Level 3: 3×ResBlock (+ skip)    ║
-║      ↑ Upsample                  ║
-║  Level 2: 3×ResBlock (+ skip)    ║
-║      ↑ Upsample                  ║
-║  Level 1: 3×ResBlock (+ skip)    ║
-║      ↑ Upsample                  ║
-║  Level 0: 3×ResBlock (+ skip)    ║
-╚═══════════════════════════════════╝
-    │
-    ▼
-输出层 (GN → SiLU → Conv 3×3)
-    │
-    ▼
-预测 logits (B, C_out, H, W)
-```
+| 超参数名称 | 默认值 | 含　义 |
+|:---------:|:------:|:------:|
+| 基础通道数 | 64 | 第一层级的特征通道数 |
+| 通道倍增系数 | (1, 2, 4, 8) | 各层级相对于基础通道数的倍数 |
+| 残差块数量 | 2 | 编码器每层级的条件残差块数量 |
+| 注意力分辨率 | (16, 8) | 启用自注意力的特征图尺寸（单位：像素） |
+| 时间嵌入维度 | 256 | 时间步嵌入向量的维度 |
+| Dropout 比率 | 0.1 | 随机失活比率 |
+| 输入图像分辨率 | 256 | 默认输入尺寸（像素） |
 
-### 11.3 网络参数
+编码器各层级通道数依次为 64→128→256→512，解码器与之对称。
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `base_channels` | 64 | 基础通道数 |
-| `channel_mult` | (1, 2, 4, 8) | 各层通道倍数 |
-| `num_res_blocks` | 2 | 每层残差块数量 |
-| `attention_resolutions` | (16, 8) | 应用注意力的分辨率 |
-| `time_emb_dim` | 256 | 时间嵌入维度 |
-| `dropout` | 0.1 | Dropout 比率 |
-| `input_resolution` | 256 | 输入图像分辨率 |
+### 11.4　条件注入策略总览
 
-通道数变化：编码器 64 → 128 → 256 → 512，解码器对称上采样。
+本系统在条件去噪网络各层级采用差异化的条件注入策略，以匹配不同分辨率层级的特征语义层次，具体如表11-2所示。
 
-### 11.4 条件注入策略总结
+**表11-2　条件去噪网络各层级条件注入策略**
 
-| 编码器层级 | 分辨率 | 图像特征来源 | 注入模块 | 注入方式 |
-|-----------|--------|-------------|---------|---------|
-| 输入层 | $H \times W$ | 粗分割概率图 | PFMM | 先验调制 |
-| Level 0 | $H/2$ | ResNet Root (64ch) | CFFM | 拼接+DWConv |
-| Level 1 | $H/4$ | ResNet Stage1 (256ch) | CFFM | 拼接+DWConv |
-| Level 2 | $H/8$ | ResNet Stage2 (512ch) | CFFM | 拼接+DWConv |
-| Level 3 | $H/16$ | ResNet Stage3 (1024ch) | SACM + WS-Former | 注意力+小波 |
-| 所有层 | - | 时间步 $t$ | ResBlock 内 MLP | 加性注入 |
+| 编码器层级 | 特征图分辨率 | 图像特征来源 | 注入模块 | 注入方式 |
+|:---------:|:-----------:|:-----------:|:-------:|:-------:|
+| 输入层 | $H \times W$ | 粗分割概率图 $P$ | PFMM | 类别加权特征调制 |
+| 第0层级 | $H/2$ | 编码器 Root（64 通道）| CFFM | 拼接+深度可分离卷积 |
+| 第1层级 | $H/4$ | Stage 1（256 通道）| CFFM | 拼接+深度可分离卷积 |
+| 第2层级 | $H/8$ | Stage 2（512 通道）| CFFM | 拼接+深度可分离卷积 |
+| 第3层级 | $H/16$ | Stage 3（1024 通道）| SACM + WS-Former | 双路注意力+小波交叉注意力 |
+| 全部层级 | — | 时间步 $t$ | 条件残差块内 MLP | 通道级加性注入 |
 
----
 
-## 12. 扩散优化器 (Diffusion Refiner)
+## 第十二节　扩散精细化优化器
 
-### 12.1 概述
+### 12.1　概述
 
-扩散优化器（`DiffusionRefiner` 类）是最顶层的封装模块，整合了冻结的 CPUNet 粗分割网络、高斯扩散调度器和条件去噪U-Net，提供端到端的训练和推理接口。
+扩散精细化优化器是整个系统最顶层的封装模块，负责整合冻结的 CPUNet 粗分割网络、高斯扩散调度器与条件去噪网络，并提供统一的端到端训练与推理接口。在训练阶段，CPUNet 的所有参数均被冻结，系统仅对条件去噪网络的参数进行优化，有效降低了训练阶段的显存需求与优化复杂度。
 
-### 12.2 训练过程
+### 12.2　训练过程
 
-训练阶段的计算流程如下：
+训练阶段的完整计算流程如下。
 
-1. **获取粗分割掩码**：$P = \text{softmax}(\text{CPUNet}(I))$
+**（1）获取粗分割掩码**
 
-2. **条件增强**（50% 概率应用）：
-   - 随机形态学操作（膨胀/腐蚀），模拟推理时的粗分割误差
-   - 添加小幅高斯噪声扰动：$P' = \text{clamp}(P + \mathcal{N}(0, 0.05^2), 0, 1)$
+$$P = \text{softmax}\!\left(\text{CPUNet}(I)\right) \tag{12-1}$$
 
-3. **准备真值**：将 Ground Truth 掩码 $M$ 缩放到 $[-1, 1]$：$x_0 = 2M - 1$
+**（2）条件增强**
 
-4. **前向扩散**：随机采样时间步 $t \sim \text{Uniform}(0, T)$，添加噪声：$(x_t, \epsilon) = q(x_0, t)$
+以 50% 的概率对粗分割概率图施加随机形态学操作（膨胀或腐蚀），模拟推理阶段粗分割误差的分布特性，提升精细化网络对不完美粗分割结果的鲁棒性。此后加入幅度为 0.05 的高斯噪声扰动：
 
-5. **去噪预测**：$\hat{x}_0 = f_\theta(x_t, t, I, P)$（网络直接预测 $x_0$ 的 logits）
+$$P' = \text{clamp}\!\left(P + \mathcal{N}(0,\; 0.05^2),\; 0,\; 1\right) \tag{12-2}$$
 
-6. **损失计算**：
+**（3）真值标签归一化**
 
-$$\mathcal{L} = \mathcal{L}_{\text{BCE}} + \mathcal{L}_{\text{Dice}}$$
+将 Ground Truth 掩码 $M \in \{0, 1\}^{H \times W}$ 缩放至扩散模型所要求的 $[-1, 1]$ 值域：
 
-其中：
+$$x_0 = 2M - 1 \tag{12-3}$$
 
-$$\mathcal{L}_{\text{BCE}} = -\frac{1}{N}\sum_i[M_i \log(\hat{p}_i) + (1 - M_i)\log(1 - \hat{p}_i)]$$
+**（4）前向扩散采样**
 
-$$\mathcal{L}_{\text{Dice}} = 1 - \frac{2\sum_i \hat{p}_i M_i + \epsilon}{\sum_i \hat{p}_i + \sum_i M_i + \epsilon}$$
+在时间步域均匀采样 $t \sim \mathcal{U}(0, T)$，对真值标签执行前向扩散：
 
-### 12.3 推理过程
+$$(x_t,\; \epsilon) = q(x_0,\; t) \tag{12-4}$$
 
-推理阶段采用 DDIM 采样策略：
+**（5）去噪预测**
 
-1. **获取粗分割掩码**：$P = \text{softmax}(\text{CPUNet}(I))$
+将噪声掩码 $x_t$、时间步 $t$、原始图像 $I$ 及条件增强后的粗分割掩码 $P'$ 一并送入条件去噪网络，直接预测干净掩码的 logits：
 
-2. **缩放至扩散空间**：$P_{\text{scaled}} = 2P - 1$
+$$\hat{x}_0 = f_\theta(x_t,\; t,\; I,\; P') \tag{12-5}$$
 
-3. **从中间时间步开始**：默认 $t_{\text{start}} = 0.7T$，对粗分割掩码添加对应噪声水平的噪声
+**（6）混合损失函数**
 
-4. **DDIM 反向采样**：在 20-50 个等间距子时间步上逐步去噪
+本系统采用二元交叉熵损失与 Dice 损失的等权加和作为训练目标：
 
-5. **缩放回概率空间**：$\hat{M} = \text{clamp}((x_0 + 1) / 2, 0, 1)$
+$$\mathcal{L} = \mathcal{L}_{\text{BCE}} + \mathcal{L}_{\text{Dice}} \tag{12-6}$$
 
-### 12.4 设计动机
+其中，
 
-从粗分割结果（而非纯噪声）出发进行去噪是本系统的关键设计选择。这种策略确保了：
-- 整体分割结构得以保留（粗分割已捕获主要形态）
-- 去噪过程集中于边界细化和噪声消除
-- 推理效率显著提高（仅需从 $0.7T$ 而非 $T$ 开始去噪）
+$$\mathcal{L}_{\text{BCE}} = -\frac{1}{N}\sum_{i=1}^{N}\left[M_i \log \hat{p}_i + (1 - M_i)\log(1 - \hat{p}_i)\right] \tag{12-7}$$
 
----
+$$\mathcal{L}_{\text{Dice}} = 1 - \frac{2\displaystyle\sum_{i=1}^{N} \hat{p}_i M_i + \varepsilon}{\displaystyle\sum_{i=1}^{N} \hat{p}_i + \sum_{i=1}^{N} M_i + \varepsilon} \tag{12-8}$$
 
-## 13. 总结 (Summary)
+$\hat{p}_i = \sigma(\hat{x}_{0,i})$ 为预测概率，$\varepsilon = 10^{-5}$ 为数值稳定系数。Dice 损失对前景目标区域具有更强的关注能力，与交叉熵损失互补，有助于缓解医学图像中常见的类别不均衡问题。
 
-本文详细描述了基于条件扩散模型的医学图像分割优化系统中扩散模块的各个组件。各模块的协作关系总结如下：
+### 12.3　推理过程
 
-| 模块 | 角色 | 关键创新点 |
-|------|------|-----------|
-| 高斯扩散调度器 | 噪声调度管理 | 支持线性/余弦调度，DDIM 加速采样 |
-| 时间步嵌入 | 噪声水平感知 | 正弦编码 + MLP 变换 |
-| 条件残差块 | 基础特征提取 | 时间步条件加性注入 |
-| 自注意力块 | 长距离依赖建模 | 选择性应用于低分辨率层 |
-| PFMM | 先验信息注入 | 类别感知的特征调制 |
-| CFFM | 低级特征融合 | 深度可分离卷积+残差的高效融合 |
-| SACM | 高级语义融合 | 双路注意力（通道+空间） |
-| 图像特征编码器 | 多尺度特征提取 | ResNet-V2 预激活瓶颈 |
-| WS-Former | 频率域特征交互 | 小波分解+交叉注意力+时间门控 |
-| 条件去噪U-Net | 主体去噪网络 | 多模块集成的编码器-解码器 |
-| 扩散优化器 | 端到端封装 | 粗分割起始+条件增强+混合损失 |
+推理阶段基于 DDIM 加速采样策略，执行流程如下。
 
-该系统通过将扩散模型与丰富的条件信息（原始图像多尺度特征、粗分割先验、频率域表示）相结合，实现了高质量的医学图像分割边界优化。
+首先由 CPUNet 生成粗分割掩码 $P$，并将其归一化至扩散值域：$P_{\text{scaled}} = 2P - 1$。
 
----
+与从纯高斯噪声出发的标准扩散推理不同，本系统采用**中间时间步启动策略**：默认将粗分割掩码视为 $x_0$，并在中间时间步 $t_{\text{start}} = \lfloor 0.7T \rceil$ 处对其添加对应噪声水平的噪声，作为 DDIM 反向采样的初始状态：
 
-## 参考文献 (References)
+$$x_{t_{\text{start}}} = \sqrt{\bar{\alpha}_{t_{\text{start}}}}\, P_{\text{scaled}} + \sqrt{1 - \bar{\alpha}_{t_{\text{start}}}}\, \varepsilon,\quad \varepsilon \sim \mathcal{N}(0,\mathbf{I}) \tag{12-9}$$
 
-1. Ho, J., Jain, A., & Abbeel, P. (2020). Denoising diffusion probabilistic models. *NeurIPS*.
-2. Song, J., Meng, C., & Ermon, S. (2021). Denoising diffusion implicit models. *ICLR*.
-3. Nichol, A. Q., & Dhariwal, P. (2021). Improved denoising diffusion probabilistic models. *ICML*.
-4. Ronneberger, O., Fischer, P., & Brox, T. (2015). U-Net: Convolutional networks for biomedical image segmentation. *MICCAI*.
-5. Woo, S., Park, J., Lee, J. Y., & Kweon, I. S. (2018). CBAM: Convolutional block attention module. *ECCV*.
-6. Vaswani, A., et al. (2017). Attention is all you need. *NeurIPS*.
-7. He, K., Zhang, X., Ren, S., & Sun, J. (2016). Identity mappings in deep residual networks. *ECCV*.
-8. Mallat, S. (1989). A theory for multiresolution signal decomposition: The wavelet representation. *IEEE PAMI*.
+随后在 $\{t_{\text{start}}, \ldots, 0\}$ 的等间距子时间步序列上执行 20～50 步 DDIM 反向去噪，最终将输出缩放回 $[0,1]$ 的概率值域：
+
+$$\hat{M} = \text{clamp}\!\left(\frac{x_0 + 1}{2},\; 0,\; 1\right) \tag{12-10}$$
+
+### 12.4　设计分析
+
+中间时间步启动策略是本系统与标准扩散生成模型的重要区别。该策略将粗分割结果作为精细化的起点而非从随机噪声出发，有效避免了去噪过程在整体结构层面的无效探索；同时，从 $0.7T$ 而非 $T$ 开始采样将有效推理步数减少约 30%，在不显著牺牲精细化质量的前提下大幅提升了推理效率。
+
+
+## 第十三节　本章小结
+
+本章系统阐述了基于条件扩散模型的医学图像分割精细化系统中扩散模块的各核心组件。各模块的功能定位与设计要点概括于表13-1。
+
+**表13-1　扩散模块各组件功能总结**
+
+| 模　块 | 功能定位 | 核心设计要点 |
+|:------:|:--------:|:-----------:|
+| 高斯扩散调度器 | 噪声调度与采样管理 | 支持线性/余弦调度，DDIM 加速推理 |
+| 时间步嵌入编码器 | 噪声水平感知编码 | 正弦位置编码与 MLP 变换 |
+| 条件残差块 | 基础特征提取单元 | 时间步嵌入加性注入 |
+| 自注意力模块 | 全局空间依赖建模 | 选择性应用于低分辨率层级 |
+| PFMM | 输入端先验信息调制 | 类别感知的概率加权特征调制 |
+| CFFM | 低层级条件特征融合 | 深度可分离卷积与残差连接 |
+| SACM | 高层级语义注意力融合 | 通道注意力与空间注意力双路协同 |
+| 多尺度图像特征编码器 | 多尺度图像先验提取 | ResNet-V2 预激活瓶颈结构 |
+| WS-Former | 频率域跨模态特征交互 | 小波分解+交叉注意力+时间自适应门控 |
+| 条件去噪网络 | 扩散去噪主体网络 | 多模块协同的编码器—解码器架构 |
+| 扩散精细化优化器 | 端到端训练与推理封装 | 粗分割起始推理、条件增强与混合损失 |
+
+本系统通过将条件扩散模型与丰富的多源条件信息（原始图像的多尺度特征、粗分割先验概率图及频率域小波表示）深度融合，构建了一个具有较强条件感知能力的分割精细化框架，有望在医学图像分割边界质量提升方面发挥重要作用。
+
+
+## 参考文献
+
+[1] HO J, JAIN A, ABBEEL P. Denoising diffusion probabilistic models[C]//Advances in Neural Information Processing Systems. 2020: 6840-6851.
+
+[2] SONG J, MENG C, ERMON S. Denoising diffusion implicit models[C]//International Conference on Learning Representations. 2021.
+
+[3] NICHOL A Q, DHARIWAL P. Improved denoising diffusion probabilistic models[C]//International Conference on Machine Learning. PMLR, 2021: 8162-8171.
+
+[4] RONNEBERGER O, FISCHER P, BROX T. U-Net: Convolutional networks for biomedical image segmentation[C]//International Conference on Medical Image Computing and Computer-Assisted Intervention. Springer, 2015: 234-241.
+
+[5] WOO S, PARK J, LEE J Y, et al. CBAM: Convolutional block attention module[C]//Proceedings of the European Conference on Computer Vision. 2018: 3-19.
+
+[6] VASWANI A, SHAZEER N, PARMAR N, et al. Attention is all you need[C]//Advances in Neural Information Processing Systems. 2017: 5998-6008.
+
+[7] HE K, ZHANG X, REN S, et al. Identity mappings in deep residual networks[C]//European Conference on Computer Vision. Springer, 2016: 630-645.
+
+[8] MALLAT S G. A theory for multiresolution signal decomposition: the wavelet representation[J]. IEEE Transactions on Pattern Analysis and Machine Intelligence, 1989, 11(7): 674-693.
